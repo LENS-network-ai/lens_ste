@@ -10,7 +10,7 @@ from datetime import datetime
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import Subset
 
-from training import train_edge_gnn
+from training.training import train_edge_gnn
 from utils.dataset import GraphDataset  # Your existing dataset class
 from utils.config import get_parser
 

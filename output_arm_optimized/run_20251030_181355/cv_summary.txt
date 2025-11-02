@@ -1,0 +1,40 @@
+CROSS-VALIDATION SUMMARY
+========================================
+
+IMPROVED EDGE GNN
+--------------------
+Average Validation Accuracy: 0.4196 ± 0.0492
+Average Edge Sparsity: 60.0% ± 49.0% edges > 0.1
+
+MODEL CONFIGURATION
+--------------------
+Lambda (λ): 0.0001
+Regularization Mode: l0
+Warmup Epochs: 10
+Graph Size Adaptation: False
+Min Edges Per Node: 2.0
+
+L0 PARAMETERS
+--------------------
+L0 Gamma: -0.05
+L0 Zeta: 1.05
+L0 Beta: 0.66
+Initial Temperature: 5.0
+
+FOLD RESULTS
+--------------------
+Fold 1: Acc=0.3742 (Epoch 14), Sparsity=0.0%
+Overfitting: Severe (Gap: 0.4306)
+
+Fold 2: Acc=0.4430 (Epoch 1), Sparsity=100.0%
+Overfitting: Severe (Gap: 0.4251)
+
+Fold 3: Acc=0.5016 (Epoch 1), Sparsity=100.0%
+Overfitting: Severe (Gap: 0.4155)
+
+Fold 4: Acc=0.4112 (Epoch 1), Sparsity=100.0%
+Overfitting: Severe (Gap: 0.4403)
+
+Fold 5: Acc=0.3679 (Epoch 7), Sparsity=0.0%
+Overfitting: Severe (Gap: 0.4291)
+

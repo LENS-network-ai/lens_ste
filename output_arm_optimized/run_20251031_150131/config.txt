@@ -1,0 +1,35 @@
+CONFIGURATION
+====================
+
+baseline_ema: 0.95
+batch_size: 1
+beta: 0.01
+data_root: /export/home/abirbelaala/tmi2022/feature_extractor/graphs/LUAD/simclr_files
+detailed_analysis: False
+dropout: 0.3
+edge_dim: 32
+egl_mode: l0
+epochs: 50
+graph_size_adaptation: False
+hidden_dims: [256]
+initial_temp: 5.0
+l0_beta: 0.66
+l0_gamma: -0.05
+l0_method: hard-concrete
+l0_zeta: 1.05
+lambda_reg: 0.0001
+lr: 0.0001
+min_edges_per_node: 2.0
+n_class: 3
+n_features: 512
+n_folds: 5
+n_trials: 50
+output_dir: ./output_arm_optimized/run_20251031_150131
+reg_mode: l0
+run_bayesian_opt: False
+seed: 42
+sparsity_penalty: 5.0
+target_sparsity: 0.7
+train_list: /export/home/abirbelaala/trainVal5.txt
+warmup_epochs: 10
+weight_decay: 0.0005

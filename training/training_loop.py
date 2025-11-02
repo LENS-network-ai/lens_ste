@@ -1,6 +1,7 @@
 # train.py (or your training file name)
 """
 Training script with WandB logging and support for Hard-Concrete + ARM
+FIXED VERSION with FORCED DIRECT CLEAR (bypasses broken clear_logits method)
 """
 
 import os
@@ -190,19 +191,34 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                n_features, num_epochs, warmup_epochs, analysis_dir, edge_dist_dir,
                l0_method='hard-concrete'):
     """
-    Run one epoch of training with support for both Hard-Concrete and ARM
+    Run one epoch of training with FORCED DIRECT CLEAR
     
     Returns:
         dict: Training metrics
     """
-    # Set the current epoch for the model
+    # ============================================
+    # 🔍 EPOCH SETUP - Set lambda/temp ONCE
+    # ============================================
     model.set_epoch(epoch)
     
-    # Print current hyperparameters
-    temp = model.temperature if hasattr(model, 'temperature') else 0
-    lambda_val = model.regularizer.current_lambda if hasattr(model.regularizer, 'current_lambda') else 0
+    # Store initial values to verify they don't change
+    initial_lambda = model.regularizer.current_lambda if hasattr(model.regularizer, 'current_lambda') else 0
+    initial_temp = model.temperature if hasattr(model, 'temperature') else 0
     
-    print(f"   🌡️ Temperature: {temp:.4f}, λ: {lambda_val:.6f}")
+    # Debug: Print model configuration (once per epoch)
+    print(f"\n{'─'*70}")
+    print(f"🔍 EPOCH {epoch+1} CONFIGURATION")
+    print(f"{'─'*70}")
+    print(f"   use_l0: {model.use_l0 if hasattr(model, 'use_l0') else 'N/A'}")
+    print(f"   reg_mode: {model.regularizer.reg_mode if hasattr(model.regularizer, 'reg_mode') else 'N/A'}")
+    print(f"   l0_method: {l0_method}")
+    print(f"   Initial λ: {initial_lambda:.6f}")
+    print(f"   Initial temp: {initial_temp:.4f}")
+    
+    # Check regularizer capabilities
+    has_logits_storage = hasattr(model, 'regularizer') and hasattr(model.regularizer, 'logits_storage')
+    
+    print(f"   Regularizer has logits_storage: {has_logits_storage}")
     
     # Print warmup status
     if epoch < warmup_epochs:
@@ -210,6 +226,7 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
         print(f"   🔹 Warmup: {progress:.1f}% complete ({epoch+1}/{warmup_epochs} epochs)")
     else:
         print(f"   🔹 Warmup completed. Full sparsification active.")
+    print(f"{'─'*70}\n")
     
     # Training mode
     model.train()
@@ -219,18 +236,100 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
     arm_loss_sum = 0.0
     trainer.reset_metrics()
     
-    # For gradient statistics
+    # For gradient and edge statistics
     grad_norms = []
     edge_densities = []
     edge_weights_list = []
     
+    # For debugging per-batch changes
+    batch_debug_info = []
+    
+    # ============================================
+    # 🔍 BATCH LOOP WITH FORCED DIRECT CLEAR
+    # ============================================
     for batch_idx, sample in enumerate(train_loader):
         optimizer.zero_grad()
+        
+        # ============================================
+        # 🔍 DEBUG SECTION 1: BEFORE BATCH
+        # ============================================
+        if batch_idx % 50 == 0:
+            print(f"\n{'┌'+'─'*68+'┐'}")
+            print(f"│ 📍 BATCH {batch_idx:<4} - BEFORE TRAINING{' '*38}│")
+            print(f"{'└'+'─'*68+'┘'}")
+            
+            # Check regularizer state BEFORE clear
+            if hasattr(model, 'regularizer'):
+                current_lambda = model.regularizer.current_lambda
+                current_temp = model.temperature if hasattr(model, 'temperature') else 0
+                
+                print(f"   Lambda: {current_lambda:.6f} (initial: {initial_lambda:.6f})")
+                print(f"   Temp: {current_temp:.4f} (initial: {initial_temp:.4f})")
+                
+                if abs(current_lambda - initial_lambda) > 1e-6:
+                    print(f"   ⚠️⚠️⚠️ LAMBDA HAS CHANGED!")
+                if abs(current_temp - initial_temp) > 1e-6:
+                    print(f"   ⚠️⚠️⚠️ TEMPERATURE HAS CHANGED!")
+                
+                # Check logits_storage BEFORE clear
+                if has_logits_storage:
+                    num_entries_before = len(model.regularizer.logits_storage)
+                    print(f"   logits_storage entries BEFORE clear: {num_entries_before}")
+                    
+                    if num_entries_before > 0:
+                        print(f"   ⚠️ WARNING: logits_storage NOT EMPTY before clear!")
+                        print(f"   Keys: {list(model.regularizer.logits_storage.keys())[:10]}")
+        
+        # ============================================
+        # 🔧 CRITICAL FIX: FORCED DIRECT CLEAR
+        # ============================================
+        clear_success = False
+        entries_after_clear = -1
+        
+        if has_logits_storage:
+            try:
+                # Get count before
+                entries_before_clear = len(model.regularizer.logits_storage)
+                
+                # FORCE DIRECT CLEAR - bypasses any broken clear_logits() method
+                model.regularizer.logits_storage = {}
+                
+                # Verify it actually cleared
+                entries_after_clear = len(model.regularizer.logits_storage)
+                
+                if entries_after_clear == 0:
+                    clear_success = True
+                    if batch_idx % 50 == 0:
+                        print(f"   ✅ FORCED DIRECT CLEAR: {entries_before_clear} → {entries_after_clear} entries")
+                else:
+                    if batch_idx % 50 == 0:
+                        print(f"   ⚠️⚠️⚠️ CLEAR FAILED! Still has {entries_after_clear} entries after clear!")
+                        print(f"   This should be IMPOSSIBLE - Python dict assignment failed?")
+                
+            except Exception as e:
+                if batch_idx % 50 == 0:
+                    print(f"   ❌ FORCED CLEAR EXCEPTION: {e}")
+        else:
+            if batch_idx % 50 == 0:
+                print(f"   ⚠️ No logits_storage attribute found!")
+        
+        # Double-check: Try to clear any other possible storage locations
+        if hasattr(model, 'regularizer'):
+            # Clear any other potential storage variables
+            if hasattr(model.regularizer, 'logits_list'):
+                model.regularizer.logits_list = []
+            if hasattr(model.regularizer, 'all_logits'):
+                model.regularizer.all_logits = []
+            if hasattr(model.regularizer, 'stored_logits'):
+                model.regularizer.stored_logits = {}
         
         # Only print stats occasionally
         if hasattr(model, 'set_print_stats'):
             model.set_print_stats(batch_idx % 50 == 0)
         
+        # ============================================
+        # 🚀 FORWARD PASS
+        # ============================================
         try:
             # Different training logic for Hard-Concrete vs ARM
             if l0_method == 'hard-concrete':
@@ -262,14 +361,12 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                 )
                 
                 # Extract classification loss
-                cls_loss_b = loss_b  # This includes cls + reg, we'll separate below
+                cls_loss_b = loss_b
                 
                 # Get logAlpha for ARM gradient computation
-                # We need to access it from edge_scorer
                 if hasattr(model.edge_scorer, 'last_logAlpha'):
                     logAlpha = model.edge_scorer.last_logAlpha
                 else:
-                    # Fallback: recompute (not ideal but safe)
                     logAlpha = None
                 
                 # Second forward pass with antithetic gates (if available)
@@ -299,6 +396,55 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
             else:
                 raise ValueError(f"Unknown l0_method: {l0_method}")
             
+            # ============================================
+            # 🔍 DEBUG SECTION 2: AFTER FORWARD
+            # ============================================
+            if batch_idx % 50 == 0:
+                print(f"\n{'┌'+'─'*68+'┐'}")
+                print(f"│ 📊 BATCH {batch_idx:<4} - AFTER FORWARD{' '*40}│")
+                print(f"{'└'+'─'*68+'┘'}")
+                
+                # Check logits_storage AFTER forward
+                if has_logits_storage:
+                    num_entries_after_forward = len(model.regularizer.logits_storage)
+                    print(f"   logits_storage entries AFTER forward: {num_entries_after_forward}")
+                    
+                    # Diagnose what happened
+                    if num_entries_after_forward == 0:
+                        print(f"   ✅ Empty - PATH A used (direct L0 computation)")
+                    elif num_entries_after_forward == 1:
+                        print(f"   ✅ Single entry - PATH B used (storage), clear worked")
+                    else:
+                        print(f"   ⚠️⚠️⚠️ MULTIPLE ENTRIES ({num_entries_after_forward})!")
+                        print(f"   THIS IS THE ACCUMULATION BUG!")
+                        print(f"   Keys: {list(model.regularizer.logits_storage.keys())[:10]}")
+                        
+                        # This should be impossible if direct clear worked
+                        if entries_after_clear == 0:
+                            print(f"   🤔 MYSTERY: Clear worked (0 entries after clear)")
+                            print(f"   But now has {num_entries_after_forward} entries after forward!")
+                            print(f"   → Forward pass must be storing MULTIPLE entries!")
+                
+                # Check loss components
+                if hasattr(model, 'stats_tracker'):
+                    if hasattr(model.stats_tracker, 'cls_loss_history') and len(model.stats_tracker.cls_loss_history) > 0:
+                        cls_loss = model.stats_tracker.cls_loss_history[-1]
+                        reg_loss = model.stats_tracker.reg_loss_history[-1]
+                        ratio = reg_loss / (cls_loss + 1e-8)
+                        print(f"   cls_loss: {cls_loss:.4f}")
+                        print(f"   reg_loss: {reg_loss:.4f}")
+                        print(f"   ratio (reg/cls): {ratio:.4f}")
+                        
+                        if ratio > 5.0:
+                            print(f"   ⚠️ Reg loss >> cls loss! Lambda may be too high")
+                        elif ratio < 0.05:
+                            print(f"   ⚠️ Reg loss << cls loss! Lambda may be too low")
+                
+                # Check edge density
+                if weighted_adj is not None:
+                    edge_density = (weighted_adj > 0.1).float().mean().item()
+                    print(f"   edge_density (>0.1): {edge_density:.4f}")
+            
             # Save visualizations periodically
             if batch_idx % 50 == 0:
                 if hasattr(model, 'save_graph_analysis'):
@@ -314,10 +460,12 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                 print(f"⚠️ Warning: Loss is {loss.item()} in batch {batch_idx}, skipping")
                 continue
             
-            if batch_idx % 20 == 0:
+            if batch_idx % 20 == 0 and batch_idx % 50 != 0:
                 print(f"   Batch {batch_idx}: Loss = {loss.item():.4f}")
             
-            # Backward pass
+            # ============================================
+            # 🔧 BACKWARD PASS
+            # ============================================
             loss.backward()
             
             # Track gradient norm
@@ -332,9 +480,29 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
-            # Optimizer step
+            # ============================================
+            # 🔧 OPTIMIZER STEP
+            # ============================================
             optimizer.step()
+            
+            # ============================================
+            # 🔍 DEBUG SECTION 3: CHECK IF SCHEDULER CHANGES LAMBDA/TEMP
+            # ============================================
+            lambda_before_sched = model.regularizer.current_lambda
+            temp_before_sched = model.temperature if hasattr(model, 'temperature') else 0
+            
             scheduler(optimizer, batch_idx, epoch, 0)
+            
+            lambda_after_sched = model.regularizer.current_lambda
+            temp_after_sched = model.temperature if hasattr(model, 'temperature') else 0
+            
+            if batch_idx % 50 == 0:
+                if abs(lambda_after_sched - lambda_before_sched) > 1e-6:
+                    print(f"   ⚠️⚠️⚠️ SCHEDULER CHANGED LAMBDA!")
+                    print(f"   {lambda_before_sched:.6f} → {lambda_after_sched:.6f}")
+                if abs(temp_after_sched - temp_before_sched) > 1e-6:
+                    print(f"   ⚠️⚠️⚠️ SCHEDULER CHANGED TEMP!")
+                    print(f"   {temp_before_sched:.4f} → {temp_after_sched:.4f}")
             
             # Track loss
             train_loss += loss.item()
@@ -344,8 +512,21 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                 edge_mask = weighted_adj > 0
                 if edge_mask.sum() > 0:
                     active_weights = weighted_adj[edge_mask]
-                    edge_densities.append((active_weights > 0.1).float().mean().item())
+                    edge_density = (active_weights > 0.1).float().mean().item()
+                    edge_densities.append(edge_density)
                     edge_weights_list.append(active_weights.detach().cpu())
+            
+            # Store batch debug info
+            if batch_idx % 50 == 0:
+                batch_debug_info.append({
+                    'batch': batch_idx,
+                    'edge_density': edge_density if weighted_adj is not None else 0,
+                    'logits_entries_before': num_entries_before if has_logits_storage else -1,
+                    'logits_entries_after_clear': entries_after_clear,
+                    'logits_entries_after_forward': num_entries_after_forward if has_logits_storage else -1,
+                    'lambda': lambda_after_sched,
+                    'temp': temp_after_sched,
+                })
             
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
@@ -356,7 +537,90 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
             else:
                 raise e
     
-    # Compute epoch metrics
+    # ============================================
+    # 🔍 EPOCH SUMMARY WITH DETAILED ANALYSIS
+    # ============================================
+    print(f"\n{'='*70}")
+    print(f"📊 EPOCH {epoch+1} SUMMARY & ANALYSIS")
+    print(f"{'='*70}")
+    
+    # Check if lambda/temp stayed constant
+    final_lambda = model.regularizer.current_lambda
+    final_temp = model.temperature if hasattr(model, 'temperature') else 0
+    
+    print(f"\n🔍 Hyperparameter Stability:")
+    print(f"   Lambda: {initial_lambda:.6f} → {final_lambda:.6f}")
+    print(f"   Temp: {initial_temp:.4f} → {final_temp:.4f}")
+    
+    if abs(final_lambda - initial_lambda) > 1e-6:
+        print(f"   ⚠️⚠️⚠️ LAMBDA CHANGED DURING EPOCH! This causes per-batch pruning!")
+    else:
+        print(f"   ✅ Lambda stayed constant")
+    
+    if abs(final_temp - initial_temp) > 1e-6:
+        print(f"   ⚠️⚠️⚠️ TEMPERATURE CHANGED DURING EPOCH!")
+    else:
+        print(f"   ✅ Temperature stayed constant")
+    
+    # Logits storage analysis
+    if batch_debug_info:
+        print(f"\n🔍 Logits Storage Analysis (sampled batches):")
+        for info in batch_debug_info:
+            print(f"   Batch {info['batch']:4d}: before={info['logits_entries_before']:3d}, "
+                  f"after_clear={info['logits_entries_after_clear']:3d}, "
+                  f"after_forward={info['logits_entries_after_forward']:3d}")
+        
+        # Check for accumulation pattern
+        after_forward_counts = [info['logits_entries_after_forward'] for info in batch_debug_info if info['logits_entries_after_forward'] >= 0]
+        
+        if after_forward_counts:
+            max_entries = max(after_forward_counts)
+            
+            if max_entries > 1:
+                print(f"\n   ⚠️⚠️⚠️ ACCUMULATION DETECTED!")
+                print(f"   Max entries after forward: {max_entries}")
+                print(f"   → Forward pass stores MULTIPLE logits per call!")
+                print(f"   → Bug is in EdgeScoring or model.forward(), not in clear!")
+            elif max_entries == 1:
+                print(f"\n   ✅ Normal: Single entry per batch (PATH B used)")
+            else:
+                print(f"\n   ✅ Empty: No storage used (PATH A - direct computation)")
+    
+    # Edge density progression analysis
+    if edge_densities:
+        print(f"\n📈 Edge Density Progression Within Epoch:")
+        
+        # Sample points throughout the epoch
+        num_batches = len(edge_densities)
+        sample_indices = [0, num_batches//4, num_batches//2, 3*num_batches//4, num_batches-1]
+        
+        for i in sample_indices:
+            if i < len(edge_densities):
+                print(f"   Batch {i:4d}: {edge_densities[i]:.4f}")
+        
+        # Calculate drop
+        total_drop = edge_densities[0] - edge_densities[-1]
+        percent_drop = (total_drop / edge_densities[0]) * 100 if edge_densities[0] > 0 else 0
+        
+        print(f"\n   Total drop: {total_drop:.4f} ({percent_drop:.1f}%)")
+        
+        # Diagnosis
+        if total_drop > 0.10:
+            print(f"   ⚠️⚠️⚠️ CATASTROPHIC DROP! (>10%)")
+            print(f"   Likely causes:")
+            print(f"     1. Logits accumulating (check analysis above)")
+            print(f"     2. Lambda/temp changing per batch")
+            print(f"     3. Lambda too high relative to classification loss")
+        elif total_drop > 0.05:
+            print(f"   ⚠️ LARGE DROP within epoch (>5%)")
+            print(f"   This should NOT happen with proper clearing!")
+        elif total_drop > 0.02:
+            print(f"   ⚠️ Moderate drop (2-5%)")
+            print(f"   Some change is expected, but monitor closely")
+        else:
+            print(f"   ✅ Small drop (<2%) - EXPECTED BEHAVIOR")
+    
+    # Compute final metrics
     train_acc = trainer.get_scores()
     avg_train_loss = train_loss / max(1, len(train_loader))
     avg_cls_loss = cls_loss_sum / max(1, len(train_loader))
@@ -374,11 +638,16 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
     else:
         mean_edge_weight = 0
     
-    print(f"   🔹 Training Accuracy: {train_acc:.4f}, Loss: {avg_train_loss:.4f}")
-    print(f"   📊 Edge Density: {mean_edge_density:.3f}, "
-          f"Mean Weight: {mean_edge_weight:.4f}")
-    print(f"   📊 Grad Norm: {mean_grad_norm:.4f}, "
-          f"Variance: {grad_variance:.6f}")
+    print(f"\n📊 Final Epoch Metrics:")
+    print(f"   Training Accuracy: {train_acc:.4f}")
+    print(f"   Total Loss: {avg_train_loss:.4f}")
+    print(f"   Cls Loss: {avg_cls_loss:.4f}")
+    print(f"   Reg Loss: {avg_reg_loss:.4f}")
+    print(f"   Reg/Cls Ratio: {(avg_reg_loss/(avg_cls_loss+1e-8)):.4f}")
+    print(f"   Edge Density: {mean_edge_density:.4f}")
+    print(f"   Mean Edge Weight: {mean_edge_weight:.4f}")
+    print(f"   Grad Norm: {mean_grad_norm:.4f}")
+    print(f"{'='*70}")
     
     # Compile metrics
     metrics = {
@@ -390,8 +659,8 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
         'mean_edge_weight': mean_edge_weight,
         'grad_norm': mean_grad_norm,
         'grad_variance': grad_variance,
-        'current_lambda': lambda_val,
-        'temperature': temp,
+        'current_lambda': final_lambda,
+        'temperature': final_temp,
     }
     
     # ARM-specific metrics

@@ -1,14 +1,15 @@
-# utils/dataset.py
 """Dataset class for the graph classification task."""
 
 import os
 from warnings import warn
-from typing import Any, Optional, List, Dict
+from typing import Any
 
 import torch
 from torch.utils import data
 from PIL import ImageFile
+from typing import Optional
 
+site: Optional[str] = 'LUAD'
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
@@ -17,11 +18,11 @@ class GraphDataset(data.Dataset):
 
     def __init__(self,
                  root: str,
-                 ids: List[str],  # ✅ Fixed: list[str] → List[str]
-                 site: Optional[str] = 'LUAD',  # ✅ Fixed: str | None → Optional[str]
-                 classdict: Optional[Dict[str, int]] = None,  # ✅ Fixed: dict[str, int] | None → Optional[Dict[str, int]]
-                 target_patch_size: Optional[int] = None,  # ✅ Fixed: int | None → Optional[int]
-                 use_refined_adj: bool = False
+                 ids: list[str],
+                 site: str | None = 'LUAD',
+                 classdict: dict[str, int] | None = None,
+                 target_patch_size: int | None = None,
+                 use_refined_adj: bool =  False
                  ) -> None:
         """Create a GraphDataset.
 
@@ -61,7 +62,7 @@ class GraphDataset(data.Dataset):
                 raise ValueError(f'Site {site} not recognized and classdict not provided')
         self.site = site
 
-    def __getitem__(self, index: int) -> Dict[str, Any]:  # ✅ Fixed: dict[str, Any] → Dict[str, Any]
+    def __getitem__(self, index: int) -> dict[str, Any]:
         info = self.ids[index].replace('\n', '')
         try:
             # Split by tab or multiple spaces to separate ID from label

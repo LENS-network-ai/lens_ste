@@ -31,23 +31,27 @@ class L0RegularizerParams:
 # Create a global default instance
 l0_params = L0RegularizerParams()
 
-def l0_train(logAlpha, min=0, max=1, params=None):
+def l0_train(logAlpha, min=0, max=1, params=None, temperature=None):
     """L0 regularization function for training - uses stochastic gates"""
     if params is None:
         params = l0_params
+    # Use temperature if provided, else use beta_l0
+    effective_beta = temperature if temperature is not None else params.beta_l0
+    
+
     
     U = torch.rand(logAlpha.size()).type_as(logAlpha) + params.eps
-    s = params.sig((torch.log(U / (1 - U)) + logAlpha) / params.beta_l0)
+    s = params.sig((torch.log(U / (1 - U)) + logAlpha) / effective_beta)
     s_bar = s * (params.zeta - params.gamma) + params.gamma
     mask = F.hardtanh(s_bar, min, max)
     return mask
 
-def l0_test(logAlpha, min=0, max=1, params=None):
+def l0_test(logAlpha, min=0, max=1, params=None, temperature=None):
     """L0 regularization function for testing - deterministic version"""
     if params is None:
         params = l0_params
-    
-    s = params.sig(logAlpha/params.beta_l0)
+    effective_beta = temperature if temperature is not None else params.beta_l0
+    s = params.sig(logAlpha/effective_beta)
     s_bar = s * (params.zeta - params.gamma) + params.gamma
     mask = F.hardtanh(s_bar, min, max)
     return mask

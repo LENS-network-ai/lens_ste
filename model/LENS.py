@@ -85,9 +85,9 @@ class ImprovedEdgeGNN(nn.Module):
         self.edge_scorer = EdgeScoringNetwork(
             feature_dim=feature_dim,
             edge_dim=edge_dim,
-            dropout=dropout,
+            l0_method=l0_method,
             l0_params=self.l0_params,
-            l0_method=l0_method
+            
         )
         
         # Pooling layer

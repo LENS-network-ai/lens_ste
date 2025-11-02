@@ -64,7 +64,7 @@ def train_edge_gnn(dataset, train_idx, val_idx, args, output_dir,
     class_weights = calculate_class_weights(dataset, train_idx).to(device)
     
     # Import model
-    from LENS import ImprovedEdgeGNN
+    from model.LENS import ImprovedEdgeGNN
     
     # Get regularization parameters (support both old and new naming)
     lambda_reg = args.lambda_reg if hasattr(args, 'lambda_reg') else args.beta
@@ -80,7 +80,7 @@ def train_edge_gnn(dataset, train_idx, val_idx, args, output_dir,
     # Initialize model
     model = ImprovedEdgeGNN(
         feature_dim=512,
-        hidden_dim=512,
+        hidden_dim=256,
         num_classes=args.n_class,
         lambda_reg=lambda_reg,
         reg_mode=reg_mode,
@@ -149,7 +149,7 @@ def train_edge_gnn(dataset, train_idx, val_idx, args, output_dir,
             
             # Architecture
             'feature_dim': 512,
-            'hidden_dim': 512,
+            'hidden_dim': 256,
             'edge_dim': args.edge_dim,
             'num_classes': args.n_class,
             'dropout': args.dropout,
