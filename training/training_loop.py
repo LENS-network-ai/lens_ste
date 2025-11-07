@@ -1,7 +1,7 @@
-# train.py (or your training file name)
+# training/training_loop.py
 """
-Training script with WandB logging and support for Hard-Concrete + ARM
-FIXED VERSION with FORCED DIRECT CLEAR (bypasses broken clear_logits method)
+Training loop with WandB logging and TARGET DENSITY CONTROL
+Supports Hard-Concrete + ARM with adaptive lambda and density loss
 """
 
 import os
@@ -16,10 +16,10 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
                       num_epochs, n_features, output_dir, warmup_epochs=5,
                       wandb_config=None, l0_method='hard-concrete'):
     """
-    Train and evaluate a model with WandB logging
+    Train and evaluate a model with WandB logging and density control
     
     Args:
-        model: LENS model
+        model: LENS model with density control
         train_loader: Training data loader
         val_loader: Validation data loader
         optimizer: Optimizer
@@ -60,6 +60,10 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
     best_epoch = 0
     best_edge_sparsity = 0.0
     
+    # Track density metrics across epochs
+    density_history = []
+    alpha_history = []
+    
     # Main training loop
     for epoch in range(num_epochs):
         print(f"\n{'='*60}")
@@ -75,11 +79,14 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
         
         train_accs.append(float(train_metrics['accuracy']))
         train_losses.append(float(train_metrics['loss']))
+        density_history.append(train_metrics.get('current_density', 0))
+        alpha_history.append(train_metrics.get('avg_alpha', 1.0))
         
         # Log training metrics to WandB
         if use_wandb:
-            wandb.log({
+            log_dict = {
                 'epoch': epoch,
+                # Performance metrics
                 'train/accuracy': train_metrics['accuracy'],
                 'train/loss': train_metrics['loss'],
                 'train/cls_loss': train_metrics.get('cls_loss', 0),
@@ -87,18 +94,32 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
                 'train/edge_density': train_metrics.get('edge_density', 0),
                 'train/mean_edge_weight': train_metrics.get('mean_edge_weight', 0),
                 'train/grad_norm': train_metrics.get('grad_norm', 0),
-                'train/grad_variance': train_metrics.get('grad_variance', 0),
-                'hyperparams/lambda': train_metrics.get('current_lambda', 0),
+                
+                # 🆕 DENSITY CONTROL METRICS
+                'density/current': train_metrics.get('current_density', 0),
+                'density/deviation': train_metrics.get('density_deviation', 0),
+                'density/alpha': train_metrics.get('avg_alpha', 1.0),
+                
+                # 🆕 LAMBDA METRICS
+                'hyperparams/lambda_base': train_metrics.get('current_lambda', 0),
+                'hyperparams/lambda_eff': train_metrics.get('lambda_eff', 0),
+                'hyperparams/lambda_density': train_metrics.get('current_lambda_density', 0),
                 'hyperparams/temperature': train_metrics.get('temperature', 0),
                 'hyperparams/learning_rate': optimizer.param_groups[0]['lr'],
-            })
+            }
             
             # ARM-specific metrics
             if l0_method == 'arm' and 'arm_loss' in train_metrics:
-                wandb.log({
+                log_dict.update({
                     'train/arm_loss': train_metrics['arm_loss'],
                     'train/baseline': train_metrics.get('arm_baseline', 0),
                 })
+            
+            # Target density tracking
+            if hasattr(model.regularizer, 'target_density'):
+                log_dict['density/target'] = model.regularizer.target_density
+            
+            wandb.log(log_dict)
         
         torch.cuda.empty_cache()
         
@@ -148,6 +169,7 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_accuracy': best_val_acc,
                 'edge_sparsity': best_edge_sparsity,
+                'current_density': train_metrics.get('current_density', 0),
                 'l0_method': l0_method,
             }, model_path)
             
@@ -164,6 +186,9 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
     # Save pruned adjacencies
     save_pruned_adjacencies(trainer, adj_output_dir)
     
+    # 🆕 Final density control summary
+    print_density_control_summary(density_history, alpha_history, model.regularizer)
+    
     # Final WandB summary
     if use_wandb:
         wandb.run.summary.update({
@@ -171,6 +196,9 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
             'final_val_accuracy': val_accs[-1],
             'best_val_accuracy': best_val_acc,
             'best_epoch': best_epoch,
+            'final_density': density_history[-1] if density_history else 0,
+            'avg_density': np.mean(density_history) if density_history else 0,
+            'avg_alpha': np.mean(alpha_history) if alpha_history else 1.0,
         })
         wandb.finish()
     
@@ -181,7 +209,9 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
         "val_losses": val_losses,
         "best_val_acc": best_val_acc,
         "best_epoch": best_epoch,
-        "best_edge_sparsity": best_edge_sparsity
+        "best_edge_sparsity": best_edge_sparsity,
+        "density_history": density_history,
+        "alpha_history": alpha_history,
     }
     
     return results
@@ -191,139 +221,71 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                n_features, num_epochs, warmup_epochs, analysis_dir, edge_dist_dir,
                l0_method='hard-concrete'):
     """
-    Run one epoch of training with FORCED DIRECT CLEAR
+    Run one epoch of training WITH DENSITY CONTROL
     
     Returns:
-        dict: Training metrics
+        dict: Training metrics including density control metrics
     """
     # ============================================
-    # 🔍 EPOCH SETUP - Set lambda/temp ONCE
+    # 🔍 EPOCH SETUP
     # ============================================
     model.set_epoch(epoch)
     
-    # Store initial values to verify they don't change
-    initial_lambda = model.regularizer.current_lambda if hasattr(model.regularizer, 'current_lambda') else 0
-    initial_temp = model.temperature if hasattr(model, 'temperature') else 0
+    # 🆕 UPDATE ALL SCHEDULES (INCLUDING DENSITY LAMBDA!)
+    initial_temp = model.temperature if hasattr(model, 'temperature') else 5.0
     
-    # Debug: Print model configuration (once per epoch)
-    print(f"\n{'─'*70}")
-    print(f"🔍 EPOCH {epoch+1} CONFIGURATION")
-    print(f"{'─'*70}")
-    print(f"   use_l0: {model.use_l0 if hasattr(model, 'use_l0') else 'N/A'}")
-    print(f"   reg_mode: {model.regularizer.reg_mode if hasattr(model.regularizer, 'reg_mode') else 'N/A'}")
-    print(f"   l0_method: {l0_method}")
-    print(f"   Initial λ: {initial_lambda:.6f}")
-    print(f"   Initial temp: {initial_temp:.4f}")
-    
-    # Check regularizer capabilities
-    has_logits_storage = hasattr(model, 'regularizer') and hasattr(model.regularizer, 'logits_storage')
-    
-    print(f"   Regularizer has logits_storage: {has_logits_storage}")
-    
-    # Print warmup status
-    if epoch < warmup_epochs:
-        progress = 100 * (epoch / warmup_epochs)
-        print(f"   🔹 Warmup: {progress:.1f}% complete ({epoch+1}/{warmup_epochs} epochs)")
-    else:
-        print(f"   🔹 Warmup completed. Full sparsification active.")
-    print(f"{'─'*70}\n")
+    if hasattr(model.regularizer, 'update_all_schedules'):
+        schedules = model.regularizer.update_all_schedules(
+            current_epoch=epoch,
+            initial_temp=initial_temp
+        )
+        
+        print(f"\n{'─'*70}")
+        print(f"🔍 EPOCH {epoch+1} CONFIGURATION")
+        print(f"{'─'*70}")
+        print(f"   L0 λ: {schedules['lambda']:.6f}")
+        print(f"   Density λ: {schedules['lambda_density']:.6f}")
+        print(f"   Temperature: {schedules['temperature']:.4f}")
+        
+        if hasattr(model.regularizer, 'target_density'):
+            print(f"   Target Density: {model.regularizer.target_density*100:.1f}%")
+            print(f"   Adaptive Lambda: {model.regularizer.enable_adaptive_lambda}")
+        
+        # Warmup progress
+        if epoch < warmup_epochs:
+            progress = 100 * (epoch / warmup_epochs)
+            print(f"   🔹 Warmup: {progress:.1f}% complete ({epoch+1}/{warmup_epochs} epochs)")
+        else:
+            print(f"   🔹 Warmup completed. Full density control active.")
+        print(f"{'─'*70}\n")
     
     # Training mode
     model.train()
     train_loss = 0.0
     cls_loss_sum = 0.0
     reg_loss_sum = 0.0
+    density_loss_sum = 0.0  # 🆕
     arm_loss_sum = 0.0
     trainer.reset_metrics()
     
-    # For gradient and edge statistics
+    # For statistics
     grad_norms = []
-    edge_densities = []
+    batch_densities = []  # 🆕 Track density per batch
     edge_weights_list = []
-    
-    # For debugging per-batch changes
-    batch_debug_info = []
+    alpha_values = []  # 🆕 Track adaptive scaling per batch
+    lambda_eff_values = []  # 🆕 Track effective lambda
     
     # ============================================
-    # 🔍 BATCH LOOP WITH FORCED DIRECT CLEAR
+    # 🔍 BATCH LOOP
     # ============================================
     for batch_idx, sample in enumerate(train_loader):
         optimizer.zero_grad()
         
-        # ============================================
-        # 🔍 DEBUG SECTION 1: BEFORE BATCH
-        # ============================================
-        if batch_idx % 50 == 0:
-            print(f"\n{'┌'+'─'*68+'┐'}")
-            print(f"│ 📍 BATCH {batch_idx:<4} - BEFORE TRAINING{' '*38}│")
-            print(f"{'└'+'─'*68+'┘'}")
-            
-            # Check regularizer state BEFORE clear
-            if hasattr(model, 'regularizer'):
-                current_lambda = model.regularizer.current_lambda
-                current_temp = model.temperature if hasattr(model, 'temperature') else 0
-                
-                print(f"   Lambda: {current_lambda:.6f} (initial: {initial_lambda:.6f})")
-                print(f"   Temp: {current_temp:.4f} (initial: {initial_temp:.4f})")
-                
-                if abs(current_lambda - initial_lambda) > 1e-6:
-                    print(f"   ⚠️⚠️⚠️ LAMBDA HAS CHANGED!")
-                if abs(current_temp - initial_temp) > 1e-6:
-                    print(f"   ⚠️⚠️⚠️ TEMPERATURE HAS CHANGED!")
-                
-                # Check logits_storage BEFORE clear
-                if has_logits_storage:
-                    num_entries_before = len(model.regularizer.logits_storage)
-                    print(f"   logits_storage entries BEFORE clear: {num_entries_before}")
-                    
-                    if num_entries_before > 0:
-                        print(f"   ⚠️ WARNING: logits_storage NOT EMPTY before clear!")
-                        print(f"   Keys: {list(model.regularizer.logits_storage.keys())[:10]}")
+        # Clear logits storage (forced direct clear)
+        if hasattr(model, 'regularizer') and hasattr(model.regularizer, 'logits_storage'):
+            model.regularizer.logits_storage = {}
         
-        # ============================================
-        # 🔧 CRITICAL FIX: FORCED DIRECT CLEAR
-        # ============================================
-        clear_success = False
-        entries_after_clear = -1
-        
-        if has_logits_storage:
-            try:
-                # Get count before
-                entries_before_clear = len(model.regularizer.logits_storage)
-                
-                # FORCE DIRECT CLEAR - bypasses any broken clear_logits() method
-                model.regularizer.logits_storage = {}
-                
-                # Verify it actually cleared
-                entries_after_clear = len(model.regularizer.logits_storage)
-                
-                if entries_after_clear == 0:
-                    clear_success = True
-                    if batch_idx % 50 == 0:
-                        print(f"   ✅ FORCED DIRECT CLEAR: {entries_before_clear} → {entries_after_clear} entries")
-                else:
-                    if batch_idx % 50 == 0:
-                        print(f"   ⚠️⚠️⚠️ CLEAR FAILED! Still has {entries_after_clear} entries after clear!")
-                        print(f"   This should be IMPOSSIBLE - Python dict assignment failed?")
-                
-            except Exception as e:
-                if batch_idx % 50 == 0:
-                    print(f"   ❌ FORCED CLEAR EXCEPTION: {e}")
-        else:
-            if batch_idx % 50 == 0:
-                print(f"   ⚠️ No logits_storage attribute found!")
-        
-        # Double-check: Try to clear any other possible storage locations
-        if hasattr(model, 'regularizer'):
-            # Clear any other potential storage variables
-            if hasattr(model.regularizer, 'logits_list'):
-                model.regularizer.logits_list = []
-            if hasattr(model.regularizer, 'all_logits'):
-                model.regularizer.all_logits = []
-            if hasattr(model.regularizer, 'stored_logits'):
-                model.regularizer.stored_logits = {}
-        
-        # Only print stats occasionally
+        # Print stats occasionally
         if hasattr(model, 'set_print_stats'):
             model.set_print_stats(batch_idx % 50 == 0)
         
@@ -331,129 +293,92 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
         # 🚀 FORWARD PASS
         # ============================================
         try:
-            # Different training logic for Hard-Concrete vs ARM
             if l0_method == 'hard-concrete':
                 # Standard Hard-Concrete training
                 pred, labels, loss, weighted_adj = trainer.train(
                     sample, model, n_features=n_features
                 )
                 
-                # Extract cls_loss and reg_loss if available
+                # Extract loss components
                 if hasattr(model, 'stats_tracker') and hasattr(model.stats_tracker, 'cls_loss_history'):
                     if len(model.stats_tracker.cls_loss_history) > 0:
                         cls_loss = model.stats_tracker.cls_loss_history[-1]
                         reg_loss = model.stats_tracker.reg_loss_history[-1]
                         cls_loss_sum += cls_loss
                         reg_loss_sum += reg_loss
+                        
+                        # 🆕 Extract density loss if available
+                        if hasattr(model.stats_tracker, 'density_loss_history'):
+                            if len(model.stats_tracker.density_loss_history) > 0:
+                                density_loss = model.stats_tracker.density_loss_history[-1]
+                                density_loss_sum += density_loss
                 
             elif l0_method == 'arm':
-                # ARM training requires two forward passes
-                
-                # Prepare input
+                # ARM training
                 node_feat, labels, adjs, masks = preparefeatureLabel(
                     sample['image'], sample['label'], sample['adj_s'], n_features=n_features
                 )
                 
-                # First forward pass with sampled gates
                 pred, labels_out, loss_b, weighted_adj, edge_weights_anti = model(
                     node_feat, labels, adjs, masks,
                     return_edge_weights_anti=True
                 )
                 
-                # Extract classification loss
                 cls_loss_b = loss_b
                 
-                # Get logAlpha for ARM gradient computation
                 if hasattr(model.edge_scorer, 'last_logAlpha'):
                     logAlpha = model.edge_scorer.last_logAlpha
                 else:
                     logAlpha = None
                 
-                # Second forward pass with antithetic gates (if available)
                 if edge_weights_anti is not None and logAlpha is not None:
                     pred_anti, cls_loss_anti = model.forward_arm_antithetic(
                         node_feat, labels, adjs, edge_weights_anti, masks
                     )
-                    
-                    # Compute ARM gradient contribution
                     arm_loss = model.get_arm_gradient_loss(
                         cls_loss_b, cls_loss_anti, logAlpha
                     )
                     arm_loss_sum += arm_loss.item() if isinstance(arm_loss, torch.Tensor) else 0
                 else:
-                    cls_loss_anti = cls_loss_b
                     arm_loss = torch.tensor(0.0)
                 
-                # Total loss for ARM
                 loss = loss_b + arm_loss
-                
-                # For tracking
                 cls_loss_sum += cls_loss_b.item() if isinstance(cls_loss_b, torch.Tensor) else 0
-                
-                # Update trainer metrics manually for ARM
                 trainer.update_metrics(pred, labels)
             
             else:
                 raise ValueError(f"Unknown l0_method: {l0_method}")
             
             # ============================================
-            # 🔍 DEBUG SECTION 2: AFTER FORWARD
+            # 🆕 COMPUTE CURRENT DENSITY & ADAPTIVE METRICS
             # ============================================
-            if batch_idx % 50 == 0:
-                print(f"\n{'┌'+'─'*68+'┐'}")
-                print(f"│ 📊 BATCH {batch_idx:<4} - AFTER FORWARD{' '*40}│")
-                print(f"{'└'+'─'*68+'┘'}")
+            if weighted_adj is not None:
+                # Get original adjacency
+                node_feat_temp, labels_temp, adjs, masks_temp = preparefeatureLabel(
+                    sample['image'], sample['label'], sample['adj_s'], n_features=n_features
+                )
                 
-                # Check logits_storage AFTER forward
-                if has_logits_storage:
-                    num_entries_after_forward = len(model.regularizer.logits_storage)
-                    print(f"   logits_storage entries AFTER forward: {num_entries_after_forward}")
+                # Compute density
+                from model.EGL_L0_Reg import compute_density
+                current_density = compute_density(weighted_adj, adjs)
+                batch_densities.append(current_density.item())
+                
+                # Get adaptive scaling
+                if hasattr(model.regularizer, 'compute_adaptive_lambda'):
+                    lambda_eff, alpha = model.regularizer.compute_adaptive_lambda(current_density)
+                    alpha_values.append(alpha)
+                    lambda_eff_values.append(lambda_eff if isinstance(lambda_eff, float) else lambda_eff.item())
+                
+                # Print batch stats periodically
+                if batch_idx % 50 == 0:
+                    print(f"   Batch {batch_idx}: "
+                          f"Loss = {loss.item():.4f}, "
+                          f"Density = {current_density.item()*100:.2f}%", end="")
                     
-                    # Diagnose what happened
-                    if num_entries_after_forward == 0:
-                        print(f"   ✅ Empty - PATH A used (direct L0 computation)")
-                    elif num_entries_after_forward == 1:
-                        print(f"   ✅ Single entry - PATH B used (storage), clear worked")
-                    else:
-                        print(f"   ⚠️⚠️⚠️ MULTIPLE ENTRIES ({num_entries_after_forward})!")
-                        print(f"   THIS IS THE ACCUMULATION BUG!")
-                        print(f"   Keys: {list(model.regularizer.logits_storage.keys())[:10]}")
-                        
-                        # This should be impossible if direct clear worked
-                        if entries_after_clear == 0:
-                            print(f"   🤔 MYSTERY: Clear worked (0 entries after clear)")
-                            print(f"   But now has {num_entries_after_forward} entries after forward!")
-                            print(f"   → Forward pass must be storing MULTIPLE entries!")
-                
-                # Check loss components
-                if hasattr(model, 'stats_tracker'):
-                    if hasattr(model.stats_tracker, 'cls_loss_history') and len(model.stats_tracker.cls_loss_history) > 0:
-                        cls_loss = model.stats_tracker.cls_loss_history[-1]
-                        reg_loss = model.stats_tracker.reg_loss_history[-1]
-                        ratio = reg_loss / (cls_loss + 1e-8)
-                        print(f"   cls_loss: {cls_loss:.4f}")
-                        print(f"   reg_loss: {reg_loss:.4f}")
-                        print(f"   ratio (reg/cls): {ratio:.4f}")
-                        
-                        if ratio > 5.0:
-                            print(f"   ⚠️ Reg loss >> cls loss! Lambda may be too high")
-                        elif ratio < 0.05:
-                            print(f"   ⚠️ Reg loss << cls loss! Lambda may be too low")
-                
-                # Check edge density
-                if weighted_adj is not None:
-                    edge_density = (weighted_adj > 0.1).float().mean().item()
-                    print(f"   edge_density (>0.1): {edge_density:.4f}")
-            
-            # Save visualizations periodically
-            if batch_idx % 50 == 0:
-                if hasattr(model, 'save_graph_analysis'):
-                    model.save_graph_analysis(epoch + 1, batch_idx, save_dir=analysis_dir)
-                
-                if hasattr(model, 'plot_edge_weight_distribution'):
-                    model.plot_edge_weight_distribution(
-                        weighted_adj, epoch + 1, batch_idx, save_dir=edge_dist_dir
-                    )
+                    if alpha_values:
+                        print(f", λ_eff = {lambda_eff_values[-1]:.6f}", end="")
+                    
+                    print()
             
             # Check for NaN/Inf
             if torch.isnan(loss) or torch.isinf(loss):
@@ -480,29 +405,9 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
-            # ============================================
-            # 🔧 OPTIMIZER STEP
-            # ============================================
+            # Optimizer step
             optimizer.step()
-            
-            # ============================================
-            # 🔍 DEBUG SECTION 3: CHECK IF SCHEDULER CHANGES LAMBDA/TEMP
-            # ============================================
-            lambda_before_sched = model.regularizer.current_lambda
-            temp_before_sched = model.temperature if hasattr(model, 'temperature') else 0
-            
             scheduler(optimizer, batch_idx, epoch, 0)
-            
-            lambda_after_sched = model.regularizer.current_lambda
-            temp_after_sched = model.temperature if hasattr(model, 'temperature') else 0
-            
-            if batch_idx % 50 == 0:
-                if abs(lambda_after_sched - lambda_before_sched) > 1e-6:
-                    print(f"   ⚠️⚠️⚠️ SCHEDULER CHANGED LAMBDA!")
-                    print(f"   {lambda_before_sched:.6f} → {lambda_after_sched:.6f}")
-                if abs(temp_after_sched - temp_before_sched) > 1e-6:
-                    print(f"   ⚠️⚠️⚠️ SCHEDULER CHANGED TEMP!")
-                    print(f"   {temp_before_sched:.4f} → {temp_after_sched:.4f}")
             
             # Track loss
             train_loss += loss.item()
@@ -512,21 +417,7 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                 edge_mask = weighted_adj > 0
                 if edge_mask.sum() > 0:
                     active_weights = weighted_adj[edge_mask]
-                    edge_density = (active_weights > 0.1).float().mean().item()
-                    edge_densities.append(edge_density)
                     edge_weights_list.append(active_weights.detach().cpu())
-            
-            # Store batch debug info
-            if batch_idx % 50 == 0:
-                batch_debug_info.append({
-                    'batch': batch_idx,
-                    'edge_density': edge_density if weighted_adj is not None else 0,
-                    'logits_entries_before': num_entries_before if has_logits_storage else -1,
-                    'logits_entries_after_clear': entries_after_clear,
-                    'logits_entries_after_forward': num_entries_after_forward if has_logits_storage else -1,
-                    'lambda': lambda_after_sched,
-                    'temp': temp_after_sched,
-                })
             
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
@@ -538,135 +429,135 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                 raise e
     
     # ============================================
-    # 🔍 EPOCH SUMMARY WITH DETAILED ANALYSIS
+    # 🆕 EPOCH SUMMARY WITH DENSITY CONTROL METRICS
     # ============================================
     print(f"\n{'='*70}")
-    print(f"📊 EPOCH {epoch+1} SUMMARY & ANALYSIS")
+    print(f"📊 EPOCH {epoch+1} SUMMARY")
     print(f"{'='*70}")
-    
-    # Check if lambda/temp stayed constant
-    final_lambda = model.regularizer.current_lambda
-    final_temp = model.temperature if hasattr(model, 'temperature') else 0
-    
-    print(f"\n🔍 Hyperparameter Stability:")
-    print(f"   Lambda: {initial_lambda:.6f} → {final_lambda:.6f}")
-    print(f"   Temp: {initial_temp:.4f} → {final_temp:.4f}")
-    
-    if abs(final_lambda - initial_lambda) > 1e-6:
-        print(f"   ⚠️⚠️⚠️ LAMBDA CHANGED DURING EPOCH! This causes per-batch pruning!")
-    else:
-        print(f"   ✅ Lambda stayed constant")
-    
-    if abs(final_temp - initial_temp) > 1e-6:
-        print(f"   ⚠️⚠️⚠️ TEMPERATURE CHANGED DURING EPOCH!")
-    else:
-        print(f"   ✅ Temperature stayed constant")
-    
-    # Logits storage analysis
-    if batch_debug_info:
-        print(f"\n🔍 Logits Storage Analysis (sampled batches):")
-        for info in batch_debug_info:
-            print(f"   Batch {info['batch']:4d}: before={info['logits_entries_before']:3d}, "
-                  f"after_clear={info['logits_entries_after_clear']:3d}, "
-                  f"after_forward={info['logits_entries_after_forward']:3d}")
-        
-        # Check for accumulation pattern
-        after_forward_counts = [info['logits_entries_after_forward'] for info in batch_debug_info if info['logits_entries_after_forward'] >= 0]
-        
-        if after_forward_counts:
-            max_entries = max(after_forward_counts)
-            
-            if max_entries > 1:
-                print(f"\n   ⚠️⚠️⚠️ ACCUMULATION DETECTED!")
-                print(f"   Max entries after forward: {max_entries}")
-                print(f"   → Forward pass stores MULTIPLE logits per call!")
-                print(f"   → Bug is in EdgeScoring or model.forward(), not in clear!")
-            elif max_entries == 1:
-                print(f"\n   ✅ Normal: Single entry per batch (PATH B used)")
-            else:
-                print(f"\n   ✅ Empty: No storage used (PATH A - direct computation)")
-    
-    # Edge density progression analysis
-    if edge_densities:
-        print(f"\n📈 Edge Density Progression Within Epoch:")
-        
-        # Sample points throughout the epoch
-        num_batches = len(edge_densities)
-        sample_indices = [0, num_batches//4, num_batches//2, 3*num_batches//4, num_batches-1]
-        
-        for i in sample_indices:
-            if i < len(edge_densities):
-                print(f"   Batch {i:4d}: {edge_densities[i]:.4f}")
-        
-        # Calculate drop
-        total_drop = edge_densities[0] - edge_densities[-1]
-        percent_drop = (total_drop / edge_densities[0]) * 100 if edge_densities[0] > 0 else 0
-        
-        print(f"\n   Total drop: {total_drop:.4f} ({percent_drop:.1f}%)")
-        
-        # Diagnosis
-        if total_drop > 0.10:
-            print(f"   ⚠️⚠️⚠️ CATASTROPHIC DROP! (>10%)")
-            print(f"   Likely causes:")
-            print(f"     1. Logits accumulating (check analysis above)")
-            print(f"     2. Lambda/temp changing per batch")
-            print(f"     3. Lambda too high relative to classification loss")
-        elif total_drop > 0.05:
-            print(f"   ⚠️ LARGE DROP within epoch (>5%)")
-            print(f"   This should NOT happen with proper clearing!")
-        elif total_drop > 0.02:
-            print(f"   ⚠️ Moderate drop (2-5%)")
-            print(f"   Some change is expected, but monitor closely")
-        else:
-            print(f"   ✅ Small drop (<2%) - EXPECTED BEHAVIOR")
     
     # Compute final metrics
     train_acc = trainer.get_scores()
     avg_train_loss = train_loss / max(1, len(train_loader))
     avg_cls_loss = cls_loss_sum / max(1, len(train_loader))
     avg_reg_loss = reg_loss_sum / max(1, len(train_loader))
+    avg_density_loss = density_loss_sum / max(1, len(train_loader))
+    
+    # 🆕 Density metrics
+    avg_density = np.mean(batch_densities) if batch_densities else 0
+    avg_alpha = np.mean(alpha_values) if alpha_values else 1.0
+    avg_lambda_eff = np.mean(lambda_eff_values) if lambda_eff_values else 0
     
     # Gradient statistics
     mean_grad_norm = np.mean(grad_norms) if grad_norms else 0
-    grad_variance = np.var(grad_norms) if len(grad_norms) > 1 else 0
     
     # Edge statistics
-    mean_edge_density = np.mean(edge_densities) if edge_densities else 0
     if edge_weights_list:
         all_weights = torch.cat(edge_weights_list)
         mean_edge_weight = all_weights.mean().item()
+        edge_sparsity = (all_weights > 0.1).float().mean().item()
     else:
         mean_edge_weight = 0
+        edge_sparsity = 0
     
-    print(f"\n📊 Final Epoch Metrics:")
+    # Print performance metrics
+    print(f"\n📈 Performance Metrics:")
     print(f"   Training Accuracy: {train_acc:.4f}")
     print(f"   Total Loss: {avg_train_loss:.4f}")
-    print(f"   Cls Loss: {avg_cls_loss:.4f}")
-    print(f"   Reg Loss: {avg_reg_loss:.4f}")
+    print(f"   - Cls Loss: {avg_cls_loss:.4f}")
+    print(f"   - Reg Loss: {avg_reg_loss:.4f}")
+    if avg_density_loss > 0:
+        print(f"   - Density Loss: {avg_density_loss:.4f}")
     print(f"   Reg/Cls Ratio: {(avg_reg_loss/(avg_cls_loss+1e-8)):.4f}")
-    print(f"   Edge Density: {mean_edge_density:.4f}")
+    
+    # 🆕 Print density control metrics
+    print(f"\n🎯 Density Control:")
+    print(f"   Current Density: {avg_density*100:.2f}%")
+    
+    if hasattr(model.regularizer, 'target_density'):
+        target = model.regularizer.target_density
+        deviation = abs(avg_density - target)
+        print(f"   Target Density: {target*100:.2f}%")
+        print(f"   Deviation: {deviation*100:.1f}%")
+        
+        # Adaptive direction indicator
+        if avg_alpha > 1.05:
+            direction = "increased"
+            change = (avg_alpha - 1) * 100
+            arrow = "↑"
+        elif avg_alpha < 0.95:
+            direction = "decreased"
+            change = (1 - avg_alpha) * 100
+            arrow = "↓"
+        else:
+            direction = "stable"
+            change = 0
+            arrow = "→"
+        
+        if direction != "stable":
+            print(f"   → Adaptive: {direction} by {change:.1f}% {arrow}")
+        else:
+            print(f"   → Adaptive: {direction} {arrow}")
+        
+        # Status indicator
+        if deviation < 0.02:
+            print(f"   ✅ Excellent density control!")
+        elif deviation < 0.05:
+            print(f"   ✓ Good density control")
+        elif deviation < 0.10:
+            print(f"   ⚠️ Consider tuning lambda_density")
+        else:
+            print(f"   ⚠️⚠️ Large deviation! Check hyperparameters")
+    
+    # 🆕 Print regularization info
+    print(f"\n🔧 Regularization:")
+    if hasattr(model.regularizer, 'current_lambda'):
+        print(f"   Base L0 λ: {model.regularizer.current_lambda:.6f}")
+        if lambda_eff_values:
+            print(f"   Effective λ: {avg_lambda_eff:.6f}")
+            print(f"   Avg α: {avg_alpha:.3f}")
+    
+    if hasattr(model.regularizer, 'current_lambda_density'):
+        print(f"   Density λ: {model.regularizer.current_lambda_density:.6f}")
+    
+    # Print edge statistics
+    print(f"\n📊 Edge Statistics:")
+    print(f"   Sparsity (>0.1): {edge_sparsity:.4f}")
     print(f"   Mean Edge Weight: {mean_edge_weight:.4f}")
-    print(f"   Grad Norm: {mean_grad_norm:.4f}")
-    print(f"{'='*70}")
+    print(f"   Gradient Norm: {mean_grad_norm:.4f}")
+    print(f"{'='*70}\n")
     
     # Compile metrics
     metrics = {
+        # Performance
         'accuracy': train_acc,
         'loss': avg_train_loss,
         'cls_loss': avg_cls_loss,
         'reg_loss': avg_reg_loss,
-        'edge_density': mean_edge_density,
+        'density_loss': avg_density_loss,
+        
+        # 🆕 Density control metrics
+        'current_density': avg_density,
+        'density_deviation': abs(avg_density - model.regularizer.target_density) if hasattr(model.regularizer, 'target_density') else 0,
+        'avg_alpha': avg_alpha,
+        'lambda_eff': avg_lambda_eff,
+        
+        # Edge metrics
+        'edge_density': edge_sparsity,
         'mean_edge_weight': mean_edge_weight,
+        
+        # Training metrics
         'grad_norm': mean_grad_norm,
-        'grad_variance': grad_variance,
-        'current_lambda': final_lambda,
-        'temperature': final_temp,
+        
+        # Hyperparameters
+        'current_lambda': model.regularizer.current_lambda if hasattr(model.regularizer, 'current_lambda') else 0,
+        'current_lambda_density': model.regularizer.current_lambda_density if hasattr(model.regularizer, 'current_lambda_density') else 0,
+        'temperature': model.temperature if hasattr(model, 'temperature') else 0,
     }
     
-    # ARM-specific metrics
+    # ARM-specific
     if l0_method == 'arm':
         metrics['arm_loss'] = arm_loss_sum / max(1, len(train_loader))
-        if hasattr(model.l0_params, 'baseline'):
+        if hasattr(model, 'l0_params') and hasattr(model.l0_params, 'baseline'):
             metrics['arm_baseline'] = model.l0_params.baseline.item() if model.l0_params.baseline is not None else 0
     
     return metrics
@@ -777,6 +668,69 @@ def calculate_edge_sparsity(all_edge_weights):
             return edge_sparsity, edge_density
     
     return 0.0, 0.0
+
+
+def print_density_control_summary(density_history, alpha_history, regularizer):
+    """
+    Print comprehensive density control summary across all epochs
+    
+    Args:
+        density_history: List of density values per epoch
+        alpha_history: List of alpha values per epoch
+        regularizer: EGLassoRegularization instance
+    """
+    if not density_history:
+        return
+    
+    print(f"\n{'='*70}")
+    print(f"🎯 DENSITY CONTROL SUMMARY")
+    print(f"{'='*70}")
+    
+    # Calculate statistics
+    avg_density = np.mean(density_history)
+    final_density = density_history[-1]
+    min_density = np.min(density_history)
+    max_density = np.max(density_history)
+    
+    if hasattr(regularizer, 'target_density'):
+        target = regularizer.target_density
+        final_deviation = abs(final_density - target)
+        avg_deviation = np.mean([abs(d - target) for d in density_history])
+        
+        print(f"\n📊 Density Statistics:")
+        print(f"   Target: {target*100:.2f}%")
+        print(f"   Final: {final_density*100:.2f}%")
+        print(f"   Average: {avg_density*100:.2f}%")
+        print(f"   Range: [{min_density*100:.2f}%, {max_density*100:.2f}%]")
+        print(f"   Final Deviation: {final_deviation*100:.2f}%")
+        print(f"   Avg Deviation: {avg_deviation*100:.2f}%")
+    
+    if alpha_history:
+        avg_alpha = np.mean(alpha_history)
+        print(f"\n🔧 Adaptive Lambda Statistics:")
+        print(f"   Average α: {avg_alpha:.3f}")
+        print(f"   Final α: {alpha_history[-1]:.3f}")
+        print(f"   Range: [{np.min(alpha_history):.3f}, {np.max(alpha_history):.3f}]")
+    
+    # Assessment
+    print(f"\n✅ Assessment:")
+    if hasattr(regularizer, 'target_density'):
+        if final_deviation < 0.02:
+            print(f"   🎉 Excellent! Density within 2% of target")
+        elif final_deviation < 0.05:
+            print(f"   ✓ Good density control achieved")
+        elif final_deviation < 0.10:
+            print(f"   ⚠️ Moderate control - consider tuning lambda_density")
+        else:
+            print(f"   ⚠️⚠️ Poor control - review hyperparameters")
+            
+            # Provide specific guidance
+            if final_density < target:
+                print(f"   → Density too low: Decrease base lambda or increase lambda_density")
+            else:
+                print(f"   → Density too high: Increase base lambda or decrease lambda_density")
+    
+    print(f"{'='*70}\n")
 
 
 def save_pruned_adjacencies(trainer, adj_output_dir):
