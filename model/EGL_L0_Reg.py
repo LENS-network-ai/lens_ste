@@ -52,7 +52,27 @@ class EGLassoRegularization:
                 self.l0_params = L0RegularizerParams()  # Default fallback
         
         print(f"[EGLassoReg] Initialized: mode={reg_mode}, l0_method={l0_method}, base_lambda={lambda_reg}")
+        self.target_density = target_density  # ρ_target
+        self.lambda_density = lambda_density  # λ_ρ
+        self.alpha_min = 0.2
+        self.alpha_max = 2.0
     
+    def compute_adaptive_lambda(self, current_density):
+        """
+        Compute adaptive lambda: λ_eff = λ_base · α(t)
+        where α(t) = clip(1 + (ρ - ρ_target), α_min, α_max)
+        """
+        # Density error
+        density_error = current_density - self.target_density
+        
+        # ⭐ ADAPTIVE SCALING
+        alpha = 1.0 + density_error
+        alpha = torch.clamp(alpha, self.alpha_min, self.alpha_max)
+        
+        # Effective lambda
+        lambda_eff = self.current_lambda * alpha
+        
+        return lambda_eff, alpha.item()
     def clear_logits(self):
         """Clear stored logits for L0 regularization"""
         self.logits_storage = {}
