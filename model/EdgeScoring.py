@@ -113,27 +113,18 @@ class EdgeScoringNetwork(nn.Module):
         if adj_matrix.is_sparse:
             adj_matrix = adj_matrix.to_dense()
         
-        # Compute pairwise features for ALL potential edges
-        # This creates features for every (i,j) pair, not just existing edges
-        
-        # Expand node features to compute all pairs
-        # src_feat: [B, N, 1, D] -> [B, N, N, D]
-        # tgt_feat: [B, 1, N, D] -> [B, N, N, D]
-        src_feat = node_feat.unsqueeze(2).expand(batch_size, num_nodes, num_nodes, feat_dim)
-        tgt_feat = node_feat.unsqueeze(1).expand(batch_size, num_nodes, num_nodes, feat_dim)
-        
-        # Compute pairwise distances [B, N, N, 1]
+        edge_index = adj_matrix.nonzero(as_tuple=False)   # [E, 2]
+        src = edge_index[:, 0]
+        tgt = edge_index[:, 1]
+
+        src_feat = node_feat[:, src]
+        tgt_feat = node_feat[:, tgt]
+
         distances = torch.norm(src_feat - tgt_feat, dim=-1, keepdim=True)
-        
-        # Concatenate: [src || tgt || dist] -> [B, N, N, 2*D+1]
         edge_features = torch.cat([src_feat, tgt_feat, distances], dim=-1)
-        
-        # Reshape to [B*N*N, 2*D+1] for MLP
-        edge_features_flat = edge_features.reshape(-1, edge_features.size(-1))
-        
-        # Compute logAlpha (edge logits) for all pairs
-        logAlpha_flat = self.edge_mlp(edge_features_flat).squeeze(-1)  # [B*N*N]
-        logAlpha = logAlpha_flat.reshape(batch_size, num_nodes, num_nodes)  # [B, N, N]
+
+        logAlpha = self.edge_mlp(edge_features)
+
 
         # Logit clamping for stabilization
         logAlpha = torch.clamp(logAlpha, min=-5.0, max=5.0)
