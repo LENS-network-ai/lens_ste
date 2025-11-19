@@ -64,7 +64,7 @@ def train_edge_gnn(dataset, train_idx, val_idx, args, output_dir,
     class_weights = calculate_class_weights(dataset, train_idx).to(device)
     
     # Import model
-    from model.LENS import ImprovedEdgeGNN
+    from model.LENS2 import ImprovedEdgeGNN
     
     # Get regularization parameters (support both old and new naming)
     lambda_reg = args.lambda_reg if hasattr(args, 'lambda_reg') else args.beta
@@ -90,6 +90,13 @@ def train_edge_gnn(dataset, train_idx, val_idx, args, output_dir,
         graph_size_adaptation=args.graph_size_adaptation,
         min_edges_per_node=args.min_edges_per_node,
         dropout=args.dropout,
+        num_gnn_layers=args.num_gnn_layers,
+        num_attention_heads=args.num_attention_heads,
+        use_attention_pooling=args.use_attention_pooling,
+        use_constrained=args.use_constrained,
+        constraint_target=args.constraint_target,
+        dual_lr=args.dual_lr,
+        enable_dual_restarts=args.enable_dual_restarts,
         l0_gamma=l0_gamma,
         l0_zeta=l0_zeta,
         l0_beta=l0_beta,

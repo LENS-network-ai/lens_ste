@@ -1,7 +1,9 @@
-# training/training_loop.py
 """
-Training loop with WandB logging and TARGET DENSITY CONTROL
-Supports Hard-Concrete, ARM, and STE with adaptive lambda and density loss
+Training loop with WandB logging supporting BOTH modes:
+- PENALTY MODE: Scheduled lambda with adaptive scaling and density loss
+- CONSTRAINED MODE: Lagrangian optimization with dual variable updates
+
+Supports Hard-Concrete, ARM, and STE L0 regularization methods
 """
 
 import os
@@ -16,10 +18,11 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
                       num_epochs, n_features, output_dir, warmup_epochs=5,
                       wandb_config=None, l0_method='hard-concrete'):
     """
-    Train and evaluate a model with WandB logging and density control
+    Train and evaluate a model with WandB logging
+    Supports both PENALTY and CONSTRAINED optimization modes
     
     Args:
-        model: LENS model with density control
+        model: LENS model with penalty or constrained mode
         train_loader: Training data loader
         val_loader: Validation data loader
         optimizer: Optimizer
@@ -60,14 +63,21 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
     best_epoch = 0
     best_edge_sparsity = 0.0
     
-    # Track density metrics across epochs
+    # Track density and constraint metrics across epochs
     density_history = []
     alpha_history = []
+    constraint_violation_history = []
+    dual_lambda_history = []
+    constraint_satisfied_count = 0
+    
+    # Determine mode
+    use_constrained = hasattr(model.regularizer, 'use_constrained') and model.regularizer.use_constrained
     
     # Main training loop
     for epoch in range(num_epochs):
         print(f"\n{'='*60}")
-        print(f"🚀 Epoch {epoch+1}/{num_epochs} ({l0_method})")
+        mode_str = "CONSTRAINED" if use_constrained else "PENALTY"
+        print(f"🚀 Epoch {epoch+1}/{num_epochs} ({mode_str} - {l0_method})")
         print(f"{'='*60}")
         
         # Training phase
@@ -82,6 +92,13 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
         density_history.append(train_metrics.get('current_density', 0))
         alpha_history.append(train_metrics.get('avg_alpha', 1.0))
         
+        # Track constrained-specific metrics
+        if use_constrained:
+            constraint_violation_history.append(train_metrics.get('avg_constraint_violation', 0))
+            dual_lambda_history.append(train_metrics.get('dual_lambda', 0))
+            if train_metrics.get('constraint_satisfied_rate', 0) > 0.5:
+                constraint_satisfied_count += 1
+        
         # Log training metrics to WandB
         if use_wandb:
             log_dict = {
@@ -95,18 +112,34 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
                 'train/mean_edge_weight': train_metrics.get('mean_edge_weight', 0),
                 'train/grad_norm': train_metrics.get('grad_norm', 0),
                 
-                # 🆕 DENSITY CONTROL METRICS
+                # Density metrics
                 'density/current': train_metrics.get('current_density', 0),
                 'density/deviation': train_metrics.get('density_deviation', 0),
-                'density/alpha': train_metrics.get('avg_alpha', 1.0),
                 
-                # 🆕 LAMBDA METRICS
-                'hyperparams/lambda_base': train_metrics.get('current_lambda', 0),
-                'hyperparams/lambda_eff': train_metrics.get('lambda_eff', 0),
-                'hyperparams/lambda_density': train_metrics.get('current_lambda_density', 0),
+                # Hyperparameters
                 'hyperparams/temperature': train_metrics.get('temperature', 0),
                 'hyperparams/learning_rate': optimizer.param_groups[0]['lr'],
             }
+            
+            # Mode-specific logging
+            if use_constrained:
+                # Constrained mode metrics
+                log_dict.update({
+                    'constrained/dual_lambda': train_metrics.get('dual_lambda', 0),
+                    'constrained/constraint_violation': train_metrics.get('avg_constraint_violation', 0),
+                    'constrained/constraint_satisfied_rate': train_metrics.get('constraint_satisfied_rate', 0),
+                    'constrained/target': model.regularizer.constraint_target,
+                    'constrained/expected_l0_density': train_metrics.get('expected_l0_density', 0),
+                })
+            else:
+                # Penalty mode metrics
+                log_dict.update({
+                    'density/alpha': train_metrics.get('avg_alpha', 1.0),
+                    'penalty/lambda_base': train_metrics.get('current_lambda', 0),
+                    'penalty/lambda_eff': train_metrics.get('lambda_eff', 0),
+                    'penalty/lambda_density': train_metrics.get('current_lambda_density', 0),
+                    'penalty/target_density': model.regularizer.target_density,
+                })
             
             # ARM-specific metrics
             if l0_method == 'arm' and 'arm_loss' in train_metrics:
@@ -114,10 +147,6 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
                     'train/arm_loss': train_metrics['arm_loss'],
                     'train/baseline': train_metrics.get('arm_baseline', 0),
                 })
-            
-            # Target density tracking
-            if hasattr(model.regularizer, 'target_density'):
-                log_dict['density/target'] = model.regularizer.target_density
             
             wandb.log(log_dict)
         
@@ -163,7 +192,7 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
             
             # Save model
             model_path = os.path.join(output_dir, f'best_model_epoch{best_epoch}.pt')
-            torch.save({
+            save_dict = {
                 'epoch': best_epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -171,7 +200,16 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
                 'edge_sparsity': best_edge_sparsity,
                 'current_density': train_metrics.get('current_density', 0),
                 'l0_method': l0_method,
-            }, model_path)
+                'use_constrained': use_constrained,
+            }
+            
+            if use_constrained:
+                save_dict.update({
+                    'dual_lambda': model.regularizer.dual_lambda,
+                    'constraint_target': model.regularizer.constraint_target,
+                })
+            
+            torch.save(save_dict, model_path)
             
             # Save to WandB
             if use_wandb:
@@ -186,20 +224,39 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
     # Save pruned adjacencies
     save_pruned_adjacencies(trainer, adj_output_dir)
     
-    # 🆕 Final density control summary
-    print_density_control_summary(density_history, alpha_history, model.regularizer)
+    # 🆕 Final summary based on mode
+    if use_constrained:
+        print_constrained_summary(
+            constraint_violation_history, dual_lambda_history,
+            constraint_satisfied_count, num_epochs, model.regularizer
+        )
+    else:
+        print_density_control_summary(density_history, alpha_history, model.regularizer)
     
     # Final WandB summary
     if use_wandb:
-        wandb.run.summary.update({
+        summary_dict = {
             'final_train_accuracy': train_accs[-1],
             'final_val_accuracy': val_accs[-1],
             'best_val_accuracy': best_val_acc,
             'best_epoch': best_epoch,
             'final_density': density_history[-1] if density_history else 0,
             'avg_density': np.mean(density_history) if density_history else 0,
-            'avg_alpha': np.mean(alpha_history) if alpha_history else 1.0,
-        })
+        }
+        
+        if use_constrained:
+            summary_dict.update({
+                'final_dual_lambda': dual_lambda_history[-1] if dual_lambda_history else 0,
+                'avg_dual_lambda': np.mean(dual_lambda_history) if dual_lambda_history else 0,
+                'constraint_satisfied_epochs': constraint_satisfied_count,
+                'constraint_satisfaction_rate': constraint_satisfied_count / num_epochs if num_epochs > 0 else 0,
+            })
+        else:
+            summary_dict.update({
+                'avg_alpha': np.mean(alpha_history) if alpha_history else 1.0,
+            })
+        
+        wandb.run.summary.update(summary_dict)
         wandb.finish()
     
     results = {
@@ -212,6 +269,8 @@ def train_and_evaluate(model, train_loader, val_loader, optimizer, scheduler, de
         "best_edge_sparsity": best_edge_sparsity,
         "density_history": density_history,
         "alpha_history": alpha_history,
+        "constraint_violation_history": constraint_violation_history,
+        "dual_lambda_history": dual_lambda_history,
     }
     
     return results
@@ -221,17 +280,21 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                n_features, num_epochs, warmup_epochs, analysis_dir, edge_dist_dir,
                l0_method='hard-concrete'):
     """
-    Run one epoch of training WITH DENSITY CONTROL
+    Run one epoch of training
+    Supports BOTH penalty and constrained optimization modes
     
     Returns:
-        dict: Training metrics including density control metrics
+        dict: Training metrics including mode-specific metrics
     """
     # ============================================
     # 🔍 EPOCH SETUP
     # ============================================
     model.set_epoch(epoch)
     
-    # 🆕 UPDATE ALL SCHEDULES (INCLUDING DENSITY LAMBDA!)
+    # Determine optimization mode
+    use_constrained = hasattr(model.regularizer, 'use_constrained') and model.regularizer.use_constrained
+    
+    # Update all schedules
     initial_temp = model.temperature if hasattr(model, 'temperature') else 5.0
     
     if hasattr(model.regularizer, 'update_all_schedules'):
@@ -243,11 +306,18 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
         print(f"\n{'─'*70}")
         print(f"🔍 EPOCH {epoch+1} CONFIGURATION")
         print(f"{'─'*70}")
-        print(f"   L0 λ: {schedules['lambda']:.6f}")
-        print(f"   Density λ: {schedules['lambda_density']:.6f}")
-        print(f"   Temperature: {schedules['temperature']:.4f}")
         
-        if hasattr(model.regularizer, 'target_density'):
+        if schedules['mode'] == 'constrained':
+            print(f"   MODE: CONSTRAINED OPTIMIZATION")
+            print(f"   Dual λ: {schedules['lambda']:.6f}")
+            print(f"   Constraint Target (ε): {schedules['constraint_target']*100:.1f}%")
+            print(f"   Temperature: {schedules['temperature']:.4f}")
+            print(f"   Dual Restarts: {schedules['dual_restarts']}")
+        else:
+            print(f"   MODE: PENALTY OPTIMIZATION")
+            print(f"   L0 λ: {schedules['lambda']:.6f}")
+            print(f"   Density λ: {schedules['lambda_density']:.6f}")
+            print(f"   Temperature: {schedules['temperature']:.4f}")
             print(f"   Target Density: {model.regularizer.target_density*100:.1f}%")
             print(f"   Adaptive Lambda: {model.regularizer.enable_adaptive_lambda}")
         
@@ -256,7 +326,10 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
             progress = 100 * (epoch / warmup_epochs)
             print(f"   🔹 Warmup: {progress:.1f}% complete ({epoch+1}/{warmup_epochs} epochs)")
         else:
-            print(f"   🔹 Warmup completed. Full density control active.")
+            if use_constrained:
+                print(f"   🔹 Warmup completed. Dual updates active.")
+            else:
+                print(f"   🔹 Warmup completed. Full density control active.")
         print(f"{'─'*70}\n")
     
     # Training mode
@@ -264,16 +337,22 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
     train_loss = 0.0
     cls_loss_sum = 0.0
     reg_loss_sum = 0.0
-    density_loss_sum = 0.0  # 🆕
+    density_loss_sum = 0.0
     arm_loss_sum = 0.0
     trainer.reset_metrics()
     
     # For statistics
     grad_norms = []
-    batch_densities = []  # 🆕 Track density per batch
+    batch_densities = []
     edge_weights_list = []
-    alpha_values = []  # 🆕 Track adaptive scaling per batch
-    lambda_eff_values = []  # 🆕 Track effective lambda
+    alpha_values = []
+    lambda_eff_values = []
+    
+    # 🆕 Constrained mode tracking
+    constraint_violations = []
+    expected_l0_densities = []
+    constraint_satisfied_batches = 0
+    dual_lambda_values = []
     
     # ============================================
     # 🔍 BATCH LOOP
@@ -281,7 +360,7 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
     for batch_idx, sample in enumerate(train_loader):
         optimizer.zero_grad()
         
-        # Clear logits storage (forced direct clear)
+        # Clear logits storage
         if hasattr(model, 'regularizer') and hasattr(model.regularizer, 'logits_storage'):
             model.regularizer.logits_storage = {}
         
@@ -307,7 +386,7 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                         cls_loss_sum += cls_loss
                         reg_loss_sum += reg_loss
                         
-                        # 🆕 Extract density loss if available
+                        # Extract density loss if available (penalty mode)
                         if hasattr(model.stats_tracker, 'density_loss_history'):
                             if len(model.stats_tracker.density_loss_history) > 0:
                                 density_loss = model.stats_tracker.density_loss_history[-1]
@@ -347,7 +426,7 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                 trainer.update_metrics(pred, labels)
             
             elif l0_method == 'ste':
-                # 🆕 STE training (same as Hard-Concrete - no antithetic samples needed)
+                # STE training (same as Hard-Concrete)
                 pred, labels, loss, weighted_adj = trainer.train(
                     sample, model, n_features=n_features
                 )
@@ -370,7 +449,7 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                 raise ValueError(f"Unknown l0_method: {l0_method}. Use 'hard-concrete', 'arm', or 'ste'")
             
             # ============================================
-            # 🆕 COMPUTE CURRENT DENSITY & ADAPTIVE METRICS
+            # 🆕 COMPUTE METRICS (MODE-SPECIFIC)
             # ============================================
             if weighted_adj is not None:
                 # Get original adjacency
@@ -383,22 +462,54 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                 current_density = compute_density(weighted_adj, adjs)
                 batch_densities.append(current_density.item())
                 
-                # Get adaptive scaling
-                if hasattr(model.regularizer, 'compute_adaptive_lambda'):
-                    lambda_eff, alpha = model.regularizer.compute_adaptive_lambda(current_density)
-                    alpha_values.append(alpha)
-                    lambda_eff_values.append(lambda_eff if isinstance(lambda_eff, float) else lambda_eff.item())
+                if use_constrained:
+                    # ============================================
+                    # CONSTRAINED MODE: Track constraint violations
+                    # ============================================
+                    if hasattr(model.stats_tracker, 'constraint_violation_history'):
+                        if len(model.stats_tracker.constraint_violation_history) > 0:
+                            violation = model.stats_tracker.constraint_violation_history[-1]
+                            constraint_violations.append(violation)
+                            
+                            if violation <= 0:
+                                constraint_satisfied_batches += 1
+                    
+                    # Track expected L0 density
+                    if hasattr(model.stats_tracker, 'current_density_history'):
+                        if len(model.stats_tracker.current_density_history) > 0:
+                            exp_l0_dens = model.stats_tracker.current_density_history[-1]
+                            expected_l0_densities.append(exp_l0_dens)
+                    
+                    # Track dual lambda
+                    dual_lambda_values.append(model.regularizer.dual_lambda)
+                    
+                    # Print batch stats periodically
+                    if batch_idx % 50 == 0:
+                        satisfied = "✓" if (len(constraint_violations) > 0 and constraint_violations[-1] <= 0) else "✗"
+                        print(f"   Batch {batch_idx}: "
+                              f"Loss = {loss.item():.4f}, "
+                              f"λ_dual = {model.regularizer.dual_lambda:.6f}, "
+                              f"Violation = {constraint_violations[-1] if constraint_violations else 0:.4f} {satisfied}")
                 
-                # Print batch stats periodically
-                if batch_idx % 50 == 0:
-                    print(f"   Batch {batch_idx}: "
-                          f"Loss = {loss.item():.4f}, "
-                          f"Density = {current_density.item()*100:.2f}%", end="")
+                else:
+                    # ============================================
+                    # PENALTY MODE: Track adaptive lambda
+                    # ============================================
+                    if hasattr(model.regularizer, 'compute_adaptive_lambda'):
+                        lambda_eff, alpha = model.regularizer.compute_adaptive_lambda(current_density)
+                        alpha_values.append(alpha)
+                        lambda_eff_values.append(lambda_eff if isinstance(lambda_eff, float) else lambda_eff.item())
                     
-                    if alpha_values:
-                        print(f", λ_eff = {lambda_eff_values[-1]:.6f}", end="")
-                    
-                    print()
+                    # Print batch stats periodically
+                    if batch_idx % 50 == 0:
+                        print(f"   Batch {batch_idx}: "
+                              f"Loss = {loss.item():.4f}, "
+                              f"Density = {current_density.item()*100:.2f}%", end="")
+                        
+                        if lambda_eff_values:
+                            print(f", λ_eff = {lambda_eff_values[-1]:.6f}", end="")
+                        
+                        print()
             
             # Check for NaN/Inf
             if torch.isnan(loss) or torch.isinf(loss):
@@ -412,6 +523,23 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
             # 🔧 BACKWARD PASS
             # ============================================
             loss.backward()
+            
+            # ============================================
+            # 🆕 UPDATE DUAL VARIABLE (Constrained Mode Only)
+            # ============================================
+            if use_constrained and hasattr(model, 'last_constraint_violation'):
+                if model.last_constraint_violation is not None:
+                    # Update dual variable via projected gradient ascent
+                    new_dual_lambda = model.regularizer.update_dual_variable(
+                        model.last_constraint_violation
+                    )
+                    
+                    if batch_idx % 50 == 0:
+                        satisfied = "✓" if model.last_constraint_violation <= 0 else "✗"
+                        if model.regularizer.enable_dual_restarts and model.last_constraint_violation <= 0:
+                            print(f"   [Dual Update] λ_dual reset to 0 (constraint satisfied)")
+                        else:
+                            print(f"   [Dual Update] λ_dual = {new_dual_lambda:.6f} {satisfied}")
             
             # Track gradient norm
             total_grad_norm = 0.0
@@ -449,10 +577,11 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
                 raise e
     
     # ============================================
-    # 🆕 EPOCH SUMMARY WITH DENSITY CONTROL METRICS
+    # 🆕 EPOCH SUMMARY (MODE-SPECIFIC)
     # ============================================
     print(f"\n{'='*70}")
-    print(f"📊 EPOCH {epoch+1} SUMMARY")
+    mode_str = "CONSTRAINED" if use_constrained else "PENALTY"
+    print(f"📊 EPOCH {epoch+1} SUMMARY ({mode_str} MODE)")
     print(f"{'='*70}")
     
     # Compute final metrics
@@ -462,10 +591,8 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
     avg_reg_loss = reg_loss_sum / max(1, len(train_loader))
     avg_density_loss = density_loss_sum / max(1, len(train_loader))
     
-    # 🆕 Density metrics
+    # Density metrics
     avg_density = np.mean(batch_densities) if batch_densities else 0
-    avg_alpha = np.mean(alpha_values) if alpha_values else 1.0
-    avg_lambda_eff = np.mean(lambda_eff_values) if lambda_eff_values else 0
     
     # Gradient statistics
     mean_grad_norm = np.mean(grad_norms) if grad_norms else 0
@@ -489,14 +616,45 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
         print(f"   - Density Loss: {avg_density_loss:.4f}")
     print(f"   Reg/Cls Ratio: {(avg_reg_loss/(avg_cls_loss+1e-8)):.4f}")
     
-    # 🆕 Print density control metrics
-    print(f"\n🎯 Density Control:")
-    print(f"   Current Density: {avg_density*100:.2f}%")
+    # ============================================
+    # MODE-SPECIFIC SUMMARY
+    # ============================================
+    if use_constrained:
+        # CONSTRAINED MODE SUMMARY
+        avg_constraint_violation = np.mean(constraint_violations) if constraint_violations else 0
+        avg_expected_l0_density = np.mean(expected_l0_densities) if expected_l0_densities else 0
+        constraint_satisfied_rate = constraint_satisfied_batches / max(1, len(train_loader))
+        final_dual_lambda = model.regularizer.dual_lambda
+        
+        print(f"\n🎯 Constrained Optimization:")
+        print(f"   Constraint Target (ε): {model.regularizer.constraint_target*100:.1f}%")
+        print(f"   Expected L0 Density: {avg_expected_l0_density*100:.2f}%")
+        print(f"   Avg Constraint Violation: {avg_constraint_violation:.4f}")
+        print(f"   Constraint Satisfied: {constraint_satisfied_rate*100:.1f}% of batches")
+        print(f"   Dual Lambda (λ_co): {final_dual_lambda:.6f}")
+        
+        # Status indicator
+        if avg_constraint_violation <= 0:
+            print(f"   ✅ Constraint satisfied on average!")
+        elif avg_constraint_violation <= 0.05:
+            print(f"   ✓ Close to satisfying constraint")
+        else:
+            print(f"   ⚠️ Constraint violated - dual lambda will increase")
+        
+        # Dual restart info
+        if model.regularizer.enable_dual_restarts:
+            print(f"   📌 Dual restarts: enabled")
     
-    if hasattr(model.regularizer, 'target_density'):
-        target = model.regularizer.target_density
-        deviation = abs(avg_density - target)
-        print(f"   Target Density: {target*100:.2f}%")
+    else:
+        # PENALTY MODE SUMMARY
+        avg_alpha = np.mean(alpha_values) if alpha_values else 1.0
+        avg_lambda_eff = np.mean(lambda_eff_values) if lambda_eff_values else 0
+        
+        print(f"\n🎯 Density Control:")
+        print(f"   Current Density: {avg_density*100:.2f}%")
+        print(f"   Target Density: {model.regularizer.target_density*100:.2f}%")
+        
+        deviation = abs(avg_density - model.regularizer.target_density)
         print(f"   Deviation: {deviation*100:.1f}%")
         
         # Adaptive direction indicator
@@ -527,17 +685,14 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
             print(f"   ⚠️ Consider tuning lambda_density")
         else:
             print(f"   ⚠️⚠️ Large deviation! Check hyperparameters")
-    
-    # 🆕 Print regularization info
-    print(f"\n🔧 Regularization:")
-    if hasattr(model.regularizer, 'current_lambda'):
+        
+        print(f"\n🔧 Regularization:")
         print(f"   Base L0 λ: {model.regularizer.current_lambda:.6f}")
         if lambda_eff_values:
             print(f"   Effective λ: {avg_lambda_eff:.6f}")
             print(f"   Avg α: {avg_alpha:.3f}")
-    
-    if hasattr(model.regularizer, 'current_lambda_density'):
-        print(f"   Density λ: {model.regularizer.current_lambda_density:.6f}")
+        if model.regularizer.current_lambda_density > 0:
+            print(f"   Density λ: {model.regularizer.current_lambda_density:.6f}")
     
     # Print edge statistics
     print(f"\n📊 Edge Statistics:")
@@ -546,7 +701,9 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
     print(f"   Gradient Norm: {mean_grad_norm:.4f}")
     print(f"{'='*70}\n")
     
-    # Compile metrics
+    # ============================================
+    # COMPILE METRICS
+    # ============================================
     metrics = {
         # Performance
         'accuracy': train_acc,
@@ -555,11 +712,8 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
         'reg_loss': avg_reg_loss,
         'density_loss': avg_density_loss,
         
-        # 🆕 Density control metrics
+        # Density metrics
         'current_density': avg_density,
-        'density_deviation': abs(avg_density - model.regularizer.target_density) if hasattr(model.regularizer, 'target_density') else 0,
-        'avg_alpha': avg_alpha,
-        'lambda_eff': avg_lambda_eff,
         
         # Edge metrics
         'edge_density': edge_sparsity,
@@ -569,10 +723,34 @@ def train_epoch(epoch, model, train_loader, optimizer, scheduler, trainer,
         'grad_norm': mean_grad_norm,
         
         # Hyperparameters
-        'current_lambda': model.regularizer.current_lambda if hasattr(model.regularizer, 'current_lambda') else 0,
-        'current_lambda_density': model.regularizer.current_lambda_density if hasattr(model.regularizer, 'current_lambda_density') else 0,
         'temperature': model.temperature if hasattr(model, 'temperature') else 0,
     }
+    
+    # Add mode-specific metrics
+    if use_constrained:
+        metrics.update({
+            'dual_lambda': final_dual_lambda,
+            'avg_constraint_violation': avg_constraint_violation,
+            'constraint_satisfied_rate': constraint_satisfied_rate,
+            'expected_l0_density': avg_expected_l0_density,
+            'avg_alpha': 1.0,  # Not used
+            'lambda_eff': final_dual_lambda,
+            'current_lambda': 0.0,  # Not used
+            'current_lambda_density': 0.0,  # Not used
+            'density_deviation': 0.0,  # Not used in constrained mode
+        })
+    else:
+        metrics.update({
+            'avg_alpha': avg_alpha,
+            'lambda_eff': avg_lambda_eff,
+            'current_lambda': model.regularizer.current_lambda,
+            'current_lambda_density': model.regularizer.current_lambda_density,
+            'density_deviation': abs(avg_density - model.regularizer.target_density),
+            'dual_lambda': 0.0,  # Not used
+            'avg_constraint_violation': 0.0,  # Not used
+            'constraint_satisfied_rate': 1.0,  # Not used
+            'expected_l0_density': 0.0,  # Not used
+        })
     
     # ARM-specific
     if l0_method == 'arm':
@@ -690,9 +868,69 @@ def calculate_edge_sparsity(all_edge_weights):
     return 0.0, 0.0
 
 
+def print_constrained_summary(constraint_violation_history, dual_lambda_history,
+                             constraint_satisfied_count, num_epochs, regularizer):
+    """
+    Print comprehensive constrained optimization summary
+    
+    Args:
+        constraint_violation_history: List of violation values per epoch
+        dual_lambda_history: List of dual lambda values per epoch
+        constraint_satisfied_count: Number of epochs where constraint was satisfied
+        num_epochs: Total number of epochs
+        regularizer: EGLassoRegularization instance
+    """
+    if not constraint_violation_history:
+        return
+    
+    print(f"\n{'='*70}")
+    print(f"🎯 CONSTRAINED OPTIMIZATION SUMMARY")
+    print(f"{'='*70}")
+    
+    # Calculate statistics
+    avg_violation = np.mean(constraint_violation_history)
+    final_violation = constraint_violation_history[-1]
+    min_violation = np.min(constraint_violation_history)
+    max_violation = np.max(constraint_violation_history)
+    
+    avg_dual_lambda = np.mean(dual_lambda_history) if dual_lambda_history else 0
+    final_dual_lambda = dual_lambda_history[-1] if dual_lambda_history else 0
+    max_dual_lambda = np.max(dual_lambda_history) if dual_lambda_history else 0
+    
+    satisfaction_rate = constraint_satisfied_count / num_epochs if num_epochs > 0 else 0
+    
+    print(f"\n📊 Constraint Statistics:")
+    print(f"   Target (ε): {regularizer.constraint_target*100:.2f}%")
+    print(f"   Final Violation: {final_violation:.4f}")
+    print(f"   Avg Violation: {avg_violation:.4f}")
+    print(f"   Violation Range: [{min_violation:.4f}, {max_violation:.4f}]")
+    print(f"   Satisfaction Rate: {satisfaction_rate*100:.1f}% of epochs")
+    
+    print(f"\n🔧 Dual Variable Statistics:")
+    print(f"   Final λ_dual: {final_dual_lambda:.6f}")
+    print(f"   Average λ_dual: {avg_dual_lambda:.6f}")
+    print(f"   Max λ_dual: {max_dual_lambda:.6f}")
+    print(f"   Dual Learning Rate: {regularizer.dual_lr:.6f}")
+    print(f"   Dual Restarts: {'Enabled' if regularizer.enable_dual_restarts else 'Disabled'}")
+    
+    # Assessment
+    print(f"\n✅ Assessment:")
+    if final_violation <= 0 and satisfaction_rate > 0.7:
+        print(f"   🎉 Excellent! Constraint consistently satisfied")
+    elif final_violation <= 0:
+        print(f"   ✓ Good - final constraint satisfied")
+    elif final_violation <= 0.05:
+        print(f"   ⚠️ Close - consider increasing dual_lr")
+    else:
+        print(f"   ⚠️⚠️ Poor control - review hyperparameters")
+        print(f"   → Increase dual_lr or adjust constraint_target")
+    
+    print(f"{'='*70}\n")
+
+
 def print_density_control_summary(density_history, alpha_history, regularizer):
     """
-    Print comprehensive density control summary across all epochs
+    Print comprehensive density control summary (penalty mode)
     
     Args:
         density_history: List of density values per epoch
@@ -703,7 +941,7 @@ def print_density_control_summary(density_history, alpha_history, regularizer):
         return
     
     print(f"\n{'='*70}")
-    print(f"🎯 DENSITY CONTROL SUMMARY")
+    print(f"🎯 DENSITY CONTROL SUMMARY (PENALTY MODE)")
     print(f"{'='*70}")
     
     # Calculate statistics

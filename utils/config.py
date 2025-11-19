@@ -99,5 +99,24 @@ def get_parser():
     
     parser.add_argument('--ramp-epochs', type=int, default=20,
                         help='Number of epochs for lambda ramp after warmup (default: 20)')
-    
+    # 🆕 NEW: Constrained optimization arguments
+    parser.add_argument('--use-constrained', action='store_true',
+                    help='Use constrained optimization instead of penalty mode')
+    parser.add_argument('--constraint-target', type=float, default=0.30,
+                    help='Constraint target epsilon (expected L0 density) for constrained mode')
+    parser.add_argument('--dual-lr', type=float, default=1e-3,
+                    help='Learning rate for dual variable (constrained mode)')
+    parser.add_argument('--enable-dual-restarts', action='store_true', default=True,
+                    help='Enable dual restart heuristic (constrained mode)')
+    parser.add_argument('--disable-dual-restarts', action='store_false', dest='enable_dual_restarts',
+                       help='Disable dual restart heuristic')    
+    parser.add_argument('--num-gnn-layers', type=int, default=3,
+                    help='Number of GNN layers (default: 3)')
+    parser.add_argument('--num-attention-heads', type=int, default=4,
+                    help='Number of attention heads for pooling (default: 4)')
+    parser.add_argument('--use-attention-pooling', action='store_true', default=True,
+                    help='Use multi-head attention pooling (default: True)')
+    parser.add_argument('--no-attention-pooling', action='store_false', dest='use_attention_pooling',
+                    help='Disable attention pooling, use standard pooling')
+
     return parser

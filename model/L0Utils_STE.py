@@ -1,12 +1,13 @@
 # model/L0Utils_STE.py
 """
 Straight-Through Estimator (STE) for L0 Regularization
-Hard binary gates during training with straight-through gradients
+Binary gates during training with straight-through gradients
+
+Simplified version - no stretching parameters needed!
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class STEBinarize(torch.autograd.Function):
@@ -23,7 +24,7 @@ class STEBinarize(torch.autograd.Function):
         Forward: Binary gate based on threshold
         
         Args:
-            input: Probabilities [B, N, N] or logits
+            input: Probabilities [B, N, N]
         
         Returns:
             output: Binary gates {0, 1}
@@ -47,54 +48,43 @@ class STEBinarize(torch.autograd.Function):
         return grad_output
 
 
-def ste_sample_gates(logAlpha, l0_params, temperature=1.0):
+def ste_sample_gates(logAlpha, temperature=1.0):
     """
     Sample binary gates using STE
     
     Args:
         logAlpha: Edge logits [B, N, N]
-        l0_params: L0 parameters (uses gamma, zeta)
-        temperature: Temperature for sigmoid
+        temperature: Temperature for sigmoid (default: 1.0)
     
     Returns:
         gates: Binary gates {0, 1} [B, N, N]
-        probs: Gate probabilities [B, N, N] (for regularization)
+        probs: Gate probabilities [B, N, N] (for L0 penalty)
     """
     # Compute probabilities
     probs = torch.sigmoid(logAlpha / temperature)
     
-    # Apply stretching (like Hard-Concrete)
-    stretched_probs = probs * (l0_params.zeta - l0_params.gamma) + l0_params.gamma
-    stretched_probs = torch.clamp(stretched_probs, 0, 1)
+    # Binarize with STE (no stretching!)
+    gates = STEBinarize.apply(probs)
     
-    # Binarize with STE
-    gates = STEBinarize.apply(stretched_probs)
-    
-    return gates, stretched_probs
+    return gates, probs
 
 
-def get_expected_l0_ste(logAlpha, l0_params):
+def get_expected_l0_ste(logAlpha, temperature=1.0):
     """
     Compute expected L0 penalty for STE
     
-    Uses same formula as Hard-Concrete (expected number of active gates)
-    
     Args:
         logAlpha: Edge logits [B, N, N]
-        l0_params: L0 parameters
+        temperature: Temperature (optional, default: 1.0)
     
     Returns:
-        l0_penalty: Expected L0 penalty (scalar)
+        l0_penalty: Expected number of active gates (scalar)
     """
     # Probability of gate being active
-    probs = torch.sigmoid(logAlpha)
+    probs = torch.sigmoid(logAlpha / temperature)
     
-    # Apply stretching
-    stretched_probs = probs * (l0_params.zeta - l0_params.gamma) + l0_params.gamma
-    stretched_probs = torch.clamp(stretched_probs, 0, 1)
-    
-    # Expected L0 = sum of probabilities
-    l0_penalty = stretched_probs.sum()
+    # Expected L0 = sum of probabilities (no stretching!)
+    l0_penalty = probs.sum()
     
     return l0_penalty
 
@@ -102,14 +92,9 @@ def get_expected_l0_ste(logAlpha, l0_params):
 class STERegularizerParams:
     """
     Parameters for STE regularization
-    Same as Hard-Concrete but used differently
-    """
-    def __init__(self, gamma=-0.1, zeta=1.1):
-        self.gamma = gamma  # Lower stretch bound
-        self.zeta = zeta    # Upper stretch bound
     
-    def update_params(self, gamma=None, zeta=None):
-        if gamma is not None:
-            self.gamma = gamma
-        if zeta is not None:
-            self.zeta = zeta
+    Simplified: No parameters needed for STE!
+    (Kept for API consistency with Hard-Concrete and ARM)
+    """
+    def __init__(self):
+        pass  # No parameters needed!

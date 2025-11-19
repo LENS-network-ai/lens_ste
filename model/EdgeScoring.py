@@ -1,6 +1,6 @@
 # model/EdgeScoring.py
 """
-Edge Scoring Network with support for Hard-Concrete and ARM
+Edge Scoring Network with support for Hard-Concrete, ARM, and STE
 Works with DENSE adjacency matrices
 """
 
@@ -16,7 +16,7 @@ from model.L0Utils_ARM import arm_sample_gates, ARML0RegularizerParams
 class EdgeScoringNetwork(nn.Module):
     """
     Edge Scoring Network that computes importance scores for edges
-    Supports both Hard-Concrete and ARM L0 regularization
+    Supports Hard-Concrete, ARM, and STE L0 regularization
     """
     
     def __init__(self, feature_dim, edge_dim=32, dropout=0.2, 
@@ -27,7 +27,7 @@ class EdgeScoringNetwork(nn.Module):
             edge_dim: Hidden dimension for edge scoring MLP
             dropout: Dropout rate
             l0_params: L0RegularizerParams or ARML0RegularizerParams
-            l0_method: 'hard-concrete' or 'arm'
+            l0_method: 'hard-concrete', 'arm', or 'ste'
         """
         super().__init__()
         
@@ -55,6 +55,7 @@ class EdgeScoringNetwork(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+        
         # ============================================================
         # CRITICAL FIX: Positive bias initialization for logAlpha
         # ============================================================
@@ -68,6 +69,7 @@ class EdgeScoringNetwork(nn.Module):
 
         print("[EdgeScoring] ✅ Initialized with positive bias (gates start ~73% open)")
         # ============================================================
+        
         # Store last logAlpha for ARM gradient computation
         self.last_logAlpha = None
         
@@ -99,6 +101,7 @@ class EdgeScoringNetwork(nn.Module):
             If Hard-Concrete: (edge_weights, logAlpha)
             If ARM (training): (edge_weights, edge_weights_anti, logAlpha)
             If ARM (eval): (edge_weights, logAlpha)
+            If STE: (edge_weights, logAlpha)
         """
         batch_size, num_nodes, feat_dim = node_feat.shape
         device = node_feat.device
@@ -132,19 +135,22 @@ class EdgeScoringNetwork(nn.Module):
         logAlpha_flat = self.edge_mlp(edge_features_flat).squeeze(-1)  # [B*N*N]
         logAlpha = logAlpha_flat.reshape(batch_size, num_nodes, num_nodes)  # [B, N, N]
 
-        #  ADD THIS: Logit clamping for stabilization
+        # Logit clamping for stabilization
         logAlpha = torch.clamp(logAlpha, min=-5.0, max=5.0)
+        
         # Store for ARM gradient computation
         self.last_logAlpha = logAlpha
         
         # Create mask for valid edges (where adj_matrix > 0)
         edge_mask = (adj_matrix > 0).float()
+        
         # DEBUG CHECK (first call only)
         if not hasattr(self, '_checked'):
-          edge_mask_bool = (adj_matrix > 0)
-          mean_val = logAlpha[edge_mask_bool].mean()
-          print(f"🔍 LogAlpha mean: {mean_val:.4f} {'✅ POSITIVE' if mean_val > 0 else '⚠️ NEGATIVE'}")
-          self._checked = True 
+            edge_mask_bool = (adj_matrix > 0)
+            mean_val = logAlpha[edge_mask_bool].mean()
+            print(f"🔍 LogAlpha mean: {mean_val:.4f} {'✅ POSITIVE' if mean_val > 0 else '⚠️ NEGATIVE'}")
+            self._checked = True 
+        
         # Mask out invalid edges by setting logAlpha to very negative
         logAlpha = logAlpha * edge_mask + (1 - edge_mask) * (-1e9)
         
@@ -159,9 +165,9 @@ class EdgeScoringNetwork(nn.Module):
             if self.l0_method == 'hard-concrete':
                 # Hard-Concrete L0
                 if training:
-                    edge_weights = l0_train(logAlpha, params=params,temperature=temperature)
+                    edge_weights = l0_train(logAlpha, params=params, temperature=temperature)
                 else:
-                    edge_weights = l0_test(logAlpha, params=params,temperature=temperature)
+                    edge_weights = l0_test(logAlpha, params=params, temperature=temperature)
                 
                 # Apply edge mask
                 edge_weights = edge_weights * edge_mask
@@ -196,24 +202,40 @@ class EdgeScoringNetwork(nn.Module):
                     return edge_weights, edge_weights_anti, logAlpha
                 else:
                     return edge_weights, logAlpha
-            elif self.l0_method == 'ste':
-             # 🆕 NEW: STE method
-             from model.L0Utils_STE import ste_sample_gates
             
-             if training:
-                # Sample binary gates with STE
-                edge_weights, probs = ste_sample_gates(
-                    logAlpha, l0_params, temperature=temperature
-                )
-               
+            elif self.l0_method == 'ste':
+                # 🆕 STE: Binary gates with straight-through gradients
+                from model.L0Utils_STE import ste_sample_gates
                 
-                return edge_weights, logAlpha
+                if training:
+                    # Training: Binary gates with STE
+                    edge_weights, probs = ste_sample_gates(
+                        logAlpha,  # ✅ FIXED: was 'logits'
+                        temperature=temperature
+                    )
+                    # Apply edge mask
+                    edge_weights = edge_weights * edge_mask
+                    
+                    if print_stats:
+                        active_edges = (edge_weights > 0.5).float().sum().item()
+                        total_edges = edge_mask.sum().item()
+                        print(f"   [EdgeScoring-STE] Binary edges: {active_edges}/{total_edges:.0f} "
+                              f"({100*active_edges/max(total_edges,1):.1f}%)")
+                    
+                    return edge_weights, logAlpha
+                
+                else:
+                    # Eval mode: Hard threshold (deterministic)
+                    probs = torch.sigmoid(logAlpha / temperature)  # ✅ FIXED: was 'logits'
+                    edge_weights = (probs > 0.5).float()
+                    
+                    # Apply edge mask
+                    edge_weights = edge_weights * edge_mask
+                    
+                    return edge_weights, logAlpha  # ✅ FIXED: was 'logits'
+            
             else:
-                # Eval: Use probabilities (or hard threshold)
-                from model.L0Utils import l0_test
-                edge_weights = l0_test(logits, l0_params=l0_params)
-                return edge_weights, logits
-         
+                raise ValueError(f"Unknown l0_method: {self.l0_method}. Use 'hard-concrete', 'arm', or 'ste'")
         
         else:
             # No L0 regularization - use Gumbel-Softmax (legacy behavior)

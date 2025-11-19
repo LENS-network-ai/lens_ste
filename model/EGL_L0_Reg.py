@@ -1,15 +1,16 @@
-# model/EGL_L0_Reg.py
+
+
 """
-EGLasso Regularization with Target Density Control
+EGLasso Regularization with Target Density Control and Constrained Optimization
 
 Supports:
 - L0 regularization with Hard-Concrete (default)
 - L0 regularization with ARM
 - Exclusive Group Lasso (EGL)
-- Target density control with adaptive lambda
-- Density loss for explicit sparsity targets
+- Target density control with adaptive lambda (PENALTY MODE)
+- Constrained optimization with Lagrangian dual variables (CONSTRAINED MODE)
 
-Author: Updated with density control mechanism
+Author: Updated with constrained optimization support
 """
 
 import torch
@@ -22,7 +23,6 @@ from model.L0Utils_ARM import get_expected_l0_arm, ARML0RegularizerParams
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
-# model/EGL_L0_Reg.py - ADD THIS METHOD
 
 def compute_density(edge_weights, adj_matrix):
     """
@@ -86,14 +86,18 @@ def compute_keep_probabilities(logits, l0_params, l0_method='hard-concrete'):
 
 class EGLassoRegularization:
     """
-    Edge-Graph Lasso Regularization with Target Density Control
+    Edge-Graph Lasso Regularization with TWO MODES:
     
-    Features:
-    - L0 regularization (Hard-Concrete or ARM)
-    - Exclusive Group Lasso (EGL)
-    - Target density control with adaptive lambda
-    - Scheduled warmup for lambda and temperature
-    - Automatic density correction via opposing gradient forces
+    1. PENALTY MODE (default):
+       - Scheduled lambda with adaptive scaling
+       - Density loss for explicit sparsity targets
+       - L_total = λ_eff * L_L0 + λ_ρ * (ρ - ρ_target)²
+    
+    2. CONSTRAINED MODE (paper approach):
+       - Lagrangian optimization with dual variables
+       - Constraint: E[||z||_0] / |E| ≤ ε
+       - L_total = L_task + λ_dual * (g_const - ε)
+       - λ_dual updated via gradient ascent
     """
     
     def __init__(self, 
@@ -108,45 +112,78 @@ class EGLassoRegularization:
                  alpha_min=0.2,
                  alpha_max=2.0,
                  enable_adaptive_lambda=True,
-                 enable_density_loss=True):
+                 enable_density_loss=True,
+                 # 🆕 CONSTRAINED OPTIMIZATION PARAMETERS
+                 use_constrained=False,
+                 dual_lr=1e-3,
+                 enable_dual_restarts=True,
+                 constraint_target=0.30):
         """
-        Initialize the regularization module with density control
+        Initialize the regularization module
         
-        Args:
+        PENALTY MODE Args:
             lambda_reg: Base L0 regularization strength (λ_base)
             lambda_density: Density loss weight (λ_ρ)
             target_density: Target edge retention rate (ρ_target) in [0, 1]
+            enable_adaptive_lambda: Whether to use adaptive lambda mechanism
+            enable_density_loss: Whether to use density loss
+            alpha_min: Minimum adaptive scaling factor
+            alpha_max: Maximum adaptive scaling factor
+        
+        CONSTRAINED MODE Args:
+            use_constrained: If True, use constrained optimization (paper method)
+            dual_lr: Learning rate for dual variable (η_dual)
+            enable_dual_restarts: Enable dual restart heuristic
+            constraint_target: Constraint level ε (expected L0 density)
+        
+        Common Args:
             reg_mode: Regularization type ('l0' or 'egl')
-            warmup_epochs: Number of warmup epochs (E_warmup)
+            warmup_epochs: Number of warmup epochs
             ramp_epochs: Number of ramp-up epochs after warmup
             l0_params: L0RegularizerParams or ARML0RegularizerParams instance
             l0_method: 'hard-concrete' or 'arm'
-            alpha_min: Minimum adaptive scaling factor
-            alpha_max: Maximum adaptive scaling factor
-            enable_adaptive_lambda: Whether to use adaptive lambda mechanism
-            enable_density_loss: Whether to use density loss
         """
         # ====================================================================
         # CORE REGULARIZATION PARAMETERS
         # ====================================================================
         self.base_lambda = lambda_reg
-        self.current_lambda = 0.0  # Will increase during training
+        self.current_lambda = 0.0  # Will increase during training (penalty mode)
         self.reg_mode = reg_mode
         self.l0_method = l0_method
         self.logits_storage = {}  # For L0 regularization
         
         # ====================================================================
-        # DENSITY CONTROL PARAMETERS
+        # OPTIMIZATION MODE
+        # ====================================================================
+        self.use_constrained = use_constrained
+        
+        # ====================================================================
+        # PENALTY MODE PARAMETERS
         # ====================================================================
         self.target_density = target_density  # ρ_target
         self.base_lambda_density = lambda_density  # λ_ρ^base
         self.current_lambda_density = 0.0  # Will increase during training
-        self.enable_adaptive_lambda = enable_adaptive_lambda
-        self.enable_density_loss = enable_density_loss
+        self.enable_adaptive_lambda = enable_adaptive_lambda and not use_constrained
+        self.enable_density_loss = enable_density_loss and not use_constrained
         
-        # Adaptive lambda bounds
-        self.alpha_min = alpha_min  # Minimum scaling (reduces pruning)
-        self.alpha_max = alpha_max  # Maximum scaling (increases pruning)
+        # Adaptive lambda bounds (penalty mode only)
+        self.alpha_min = alpha_min
+        self.alpha_max = alpha_max
+        
+        # ====================================================================
+        # CONSTRAINED MODE PARAMETERS
+        # ====================================================================
+        self.dual_lr = dual_lr  # η_dual in paper
+        self.enable_dual_restarts = enable_dual_restarts
+        self.constraint_target = constraint_target  # ε in paper
+        
+        # Dual variable (Lagrange multiplier) - λ_co in paper
+        self.dual_lambda = 0.0  # Initialize at 0 as in paper (Eq. 5)
+        
+        # Track constraint violations
+        self.constraint_violation_history = []
+        self.dual_lambda_history = []
+        self.constraint_satisfied_history = []
         
         # ====================================================================
         # SCHEDULE PARAMETERS
@@ -173,75 +210,37 @@ class EGLassoRegularization:
         # LOGGING
         # ====================================================================
         print(f"\n{'='*70}")
-        print(f"[EGLassoReg] Initialized with Target Density Control")
+        if use_constrained:
+            print(f"[EGLassoReg] CONSTRAINED OPTIMIZATION MODE")
+        else:
+            print(f"[EGLassoReg] PENALTY MODE with Density Control")
         print(f"{'='*70}")
         print(f"  Regularization Mode: {reg_mode}")
         print(f"  L0 Method: {l0_method}")
-        print(f"  Base λ: {lambda_reg:.6f}")
-        print(f"  Base λ_ρ: {lambda_density:.6f}")
-        print(f"  Target Density: {target_density*100:.1f}%")
-        print(f"  Warmup Epochs: {warmup_epochs}")
+        
+        if use_constrained:
+            print(f"\n  🎯 CONSTRAINED PARAMETERS:")
+            print(f"  Constraint Target (ε): {constraint_target*100:.1f}%")
+            print(f"  Dual Learning Rate (η_dual): {dual_lr}")
+            print(f"  Dual Restarts: {'Enabled' if enable_dual_restarts else 'Disabled'}")
+            print(f"  Initial λ_dual: {self.dual_lambda}")
+        else:
+            print(f"\n  🎯 PENALTY PARAMETERS:")
+            print(f"  Base λ: {lambda_reg:.6f}")
+            print(f"  Base λ_ρ: {lambda_density:.6f}")
+            print(f"  Target Density: {target_density*100:.1f}%")
+            print(f"  Adaptive λ Range: [{alpha_min}, {alpha_max}]")
+            print(f"  Adaptive λ Enabled: {enable_adaptive_lambda}")
+            print(f"  Density Loss Enabled: {enable_density_loss}")
+        
+        print(f"\n  Warmup Epochs: {warmup_epochs}")
         print(f"  Ramp Epochs: {ramp_epochs}")
-        print(f"  Adaptive λ Range: [{alpha_min}, {alpha_max}]")
-        print(f"  Adaptive λ Enabled: {enable_adaptive_lambda}")
-        print(f"  Density Loss Enabled: {enable_density_loss}")
         print(f"{'='*70}\n")
     
     # ========================================================================
     # LOGIT STORAGE FOR L0 REGULARIZATION
     # ========================================================================
-    def compute_regularization_with_l0(self, l0_penalty, edge_weights, adj_matrix, 
-                                    return_stats=False):
-     """
-     Compute regularization when L0 penalty is already computed
     
-     This is used for Hard-Concrete, ARM, and STE where L0 penalty
-     is computed differently for each method
-    
-     Args:
-        l0_penalty: Pre-computed L0 penalty (scalar tensor)
-        edge_weights: Edge weights [B, N, N]
-        adj_matrix: Original adjacency [B, N, N]
-        return_stats: If True, return detailed statistics
-    
-     Returns:
-        reg_loss: Total regularization loss
-        stats: Dictionary with loss components (if return_stats=True)
-     """
-     # Compute current density
-     current_density = compute_density(edge_weights, adj_matrix)
-    
-     # Compute effective lambda (with adaptive mechanism if enabled)
-     if self.enable_adaptive_lambda:
-        lambda_eff, alpha = self.compute_adaptive_lambda(current_density)
-     else:
-        lambda_eff = self.current_lambda
-        alpha = 1.0
-    
-     # L0 regularization loss
-     l0_loss = lambda_eff * l0_penalty
-    
-     # Density loss (if enabled)
-     if self.enable_density_loss and self.current_epoch >= self.warmup_epochs:
-        density_deviation = torch.abs(current_density - self.target_density)
-        density_loss = self.current_lambda_density * density_deviation
-     else:
-        density_loss = torch.tensor(0.0, device=edge_weights.device)
-    
-     # Total regularization
-     reg_loss = l0_loss + density_loss
-    
-     if return_stats:
-        stats = {
-            'l0_loss': l0_loss.item() if isinstance(l0_loss, torch.Tensor) else l0_loss,
-            'density_loss': density_loss.item() if isinstance(density_loss, torch.Tensor) else density_loss,
-            'lambda_eff': lambda_eff if isinstance(lambda_eff, float) else lambda_eff.item(),
-            'alpha': alpha,
-            'current_density': current_density.item() if isinstance(current_density, torch.Tensor) else current_density,
-        }
-        return reg_loss, stats
-    
-     return reg_loss
     def clear_logits(self):
         """Clear stored logits for L0 regularization"""
         self.logits_storage = {}
@@ -257,14 +256,77 @@ class EGLassoRegularization:
         self.logits_storage[batch_idx] = logits
     
     # ========================================================================
-    # SCHEDULE UPDATES
+    # CONSTRAINED OPTIMIZATION: DUAL VARIABLE UPDATE
+    # ========================================================================
+    
+    def update_dual_variable(self, constraint_violation):
+        """
+        Update dual variable (Lagrange multiplier) via projected gradient ascent
+        
+        From paper Eq. (5):
+            λ̂^{t+1} = λ^t + η_dual * (g_const(φ) - ε)
+            λ^{t+1} = max(0, λ̂^{t+1})
+        
+        With dual restarts (paper Eq. 6):
+            λ^{t+1} = 0 if constraint satisfied, else standard update
+        
+        Args:
+            constraint_violation: Current constraint violation (g_const - ε)
+        
+        Returns:
+            updated_lambda: New dual variable value
+        """
+        if not self.use_constrained:
+            return self.current_lambda
+        
+        # Convert to scalar if needed
+        if isinstance(constraint_violation, torch.Tensor):
+            violation_value = constraint_violation.item()
+        else:
+            violation_value = constraint_violation
+        
+        # Check if constraint is satisfied (g_const ≤ ε)
+        constraint_satisfied = (violation_value <= 0)
+        
+        if self.enable_dual_restarts and constraint_satisfied:
+            # Paper Eq. (6): Dual restart - reset to 0 when constraint satisfied
+            self.dual_lambda = 0.0
+        else:
+            # Paper Eq. (5): Standard gradient ascent update
+            lambda_hat = self.dual_lambda + self.dual_lr * violation_value
+            
+            # Project to non-negative orthant
+            self.dual_lambda = max(0.0, lambda_hat)
+        
+        # Track history
+        self.dual_lambda_history.append(self.dual_lambda)
+        self.constraint_violation_history.append(violation_value)
+        self.constraint_satisfied_history.append(constraint_satisfied)
+        
+        return self.dual_lambda
+    
+    def get_effective_lambda(self):
+        """
+        Get effective lambda for current iteration
+        
+        Returns:
+            CONSTRAINED MODE: dual_lambda (learned via GDA)
+            PENALTY MODE: current_lambda (scheduled)
+        """
+        if self.use_constrained:
+            return self.dual_lambda
+        else:
+            return self.current_lambda
+    
+    # ========================================================================
+    # SCHEDULE UPDATES (Penalty Mode)
     # ========================================================================
     
     def update_lambda(self, current_epoch):
         """
         Update L0 lambda regularization strength: λ(e)
         
-        Three-phase linear schedule:
+        Three-phase linear schedule (PENALTY MODE ONLY):
         - Phase 1 (warmup): Linear from 0 to 0.1 × λ_base over E_warmup epochs
         - Phase 2 (ramp): Linear from 0.1 × λ_base to λ_base over E_ramp epochs
         - Phase 3 (plateau): Fixed at λ_base
@@ -272,6 +334,11 @@ class EGLassoRegularization:
         Args:
             current_epoch: Current training epoch
         """
+        if self.use_constrained:
+            # In constrained mode, don't use scheduled lambda
+            self.current_lambda = 0.0
+            return
+        
         self.current_epoch = current_epoch
         
         if current_epoch < self.warmup_epochs:
@@ -291,7 +358,7 @@ class EGLassoRegularization:
     
     def update_lambda_density(self, current_epoch):
         """
-        Update density lambda: λ_ρ(e)
+        Update density lambda: λ_ρ(e) (PENALTY MODE ONLY)
         
         Two-phase schedule:
         - Phase 1 (warmup): Linear from 0 to 0.5 × λ_ρ^base over E_warmup epochs
@@ -300,6 +367,11 @@ class EGLassoRegularization:
         Args:
             current_epoch: Current training epoch
         """
+        if self.use_constrained:
+            # In constrained mode, don't use density loss
+            self.current_lambda_density = 0.0
+            return
+        
         if current_epoch < self.warmup_epochs:
             # Phase 1: Warmup - linear increase to 50% of base
             progress = current_epoch / self.warmup_epochs
@@ -361,6 +433,9 @@ class EGLassoRegularization:
         """
         Convenience function to update all schedules at once
         
+        CONSTRAINED MODE: Only update temperature (λ is learned via GDA)
+        PENALTY MODE: Update lambda, lambda_density, and temperature
+        
         Args:
             current_epoch: Current training epoch
             initial_temp: Initial temperature
@@ -368,32 +443,44 @@ class EGLassoRegularization:
         Returns:
             dict with updated values
         """
-        self.update_lambda(current_epoch)
-        self.update_lambda_density(current_epoch)
+        self.current_epoch = current_epoch
         temperature = self.update_temperature(current_epoch, initial_temp)
         
-        return {
-            'lambda': self.current_lambda,
-            'lambda_density': self.current_lambda_density,
-            'temperature': temperature,
-            'epoch': current_epoch
-        }
+        if self.use_constrained:
+            # Constrained mode: dual variable is updated via gradient ascent
+            return {
+                'lambda': self.dual_lambda,
+                'lambda_density': 0.0,
+                'temperature': temperature,
+                'epoch': current_epoch,
+                'mode': 'constrained',
+                'constraint_target': self.constraint_target,
+                'dual_restarts': self.enable_dual_restarts,
+            }
+        else:
+            # Penalty mode: scheduled lambda updates
+            self.update_lambda(current_epoch)
+            self.update_lambda_density(current_epoch)
+            
+            return {
+                'lambda': self.current_lambda,
+                'lambda_density': self.current_lambda_density,
+                'temperature': temperature,
+                'epoch': current_epoch,
+                'mode': 'penalty',
+            }
     
     # ========================================================================
-    # ADAPTIVE LAMBDA MECHANISM
+    # ADAPTIVE LAMBDA MECHANISM (Penalty Mode Only)
     # ========================================================================
     
     def compute_adaptive_lambda(self, current_density):
         """
         Compute adaptive lambda: λ_eff(t) = λ_base · α(t)
+        (PENALTY MODE ONLY)
         
         Adaptive scaling factor:
             α(t) = clip(1 + [ρ(t) - ρ_target], α_min, α_max)
-        
-        Behavior:
-        - When ρ > ρ_target (too dense): α > 1, increase pruning
-        - When ρ < ρ_target (too sparse): α < 1, decrease pruning
-        - When ρ ≈ ρ_target (at target): α ≈ 1, maintain equilibrium
         
         Args:
             current_density: Current graph density ρ(t) ∈ [0, 1]
@@ -402,8 +489,7 @@ class EGLassoRegularization:
             lambda_eff: Effective lambda value (scalar or tensor)
             alpha: Adaptive scaling factor (float)
         """
-        if not self.enable_adaptive_lambda:
-            # Adaptive mechanism disabled - use current lambda directly
+        if self.use_constrained or not self.enable_adaptive_lambda:
             return self.current_lambda, 1.0
         
         # Convert density to scalar if it's a tensor
@@ -427,16 +513,13 @@ class EGLassoRegularization:
         return lambda_eff, alpha
     
     # ========================================================================
-    # DENSITY LOSS
+    # DENSITY LOSS (Penalty Mode Only)
     # ========================================================================
     
     def compute_density_loss(self, current_density):
         """
         Compute density loss: L_density = λ_ρ · (ρ - ρ_target)²
-        
-        Gradient behavior:
-        - When ρ > ρ_target: positive gradient → pushes edges down (pruning)
-        - When ρ < ρ_target: negative gradient → pulls edges up (retention)
+        (PENALTY MODE ONLY)
         
         Args:
             current_density: Current graph density ρ(t)
@@ -444,8 +527,9 @@ class EGLassoRegularization:
         Returns:
             density_loss: Density loss value (tensor)
         """
-        if not self.enable_density_loss or self.current_lambda_density == 0.0:
-            return torch.tensor(0.0, device=current_density.device if isinstance(current_density, torch.Tensor) else 'cpu')
+        if self.use_constrained or not self.enable_density_loss or self.current_lambda_density == 0.0:
+            device = current_density.device if isinstance(current_density, torch.Tensor) else 'cpu'
+            return torch.tensor(0.0, device=device)
         
         # Compute density error
         density_error = current_density - self.target_density
@@ -498,18 +582,127 @@ class EGLassoRegularization:
     # MAIN REGULARIZATION COMPUTATION
     # ========================================================================
     
+    def compute_regularization_with_l0(self, l0_penalty, edge_weights, adj_matrix, 
+                                        return_stats=False):
+        """
+        Compute regularization when L0 penalty is already computed
+        
+        CONSTRAINED MODE (use_constrained=True):
+            L_reg = λ_dual * (g_const - ε)
+            where:
+              - g_const = E[||z||_0] / |E|  (expected L0 density)
+              - ε = constraint_target
+              - λ_dual is updated via gradient ascent (paper Eq. 5-6)
+        
+        PENALTY MODE (use_constrained=False):
+            L_reg = λ_eff * L_L0 + λ_ρ * (ρ - ρ_target)²
+            where:
+              - λ_eff = λ_base * α (adaptive)
+              - λ_ρ = density lambda (scheduled)
+        
+        Args:
+            l0_penalty: Pre-computed L0 penalty (expected number of active gates)
+            edge_weights: Edge weights [B, N, N]
+            adj_matrix: Original adjacency [B, N, N]
+            return_stats: If True, return detailed statistics
+        
+        Returns:
+            reg_loss: Total regularization loss
+            stats: Dictionary with loss components (if return_stats=True)
+        """
+        device = edge_weights.device
+        
+        # Compute current density
+        current_density = compute_density(edge_weights, adj_matrix)
+        
+        # ====================================================================
+        # CONSTRAINED MODE
+        # ====================================================================
+        if self.use_constrained:
+            # Convert L0 penalty to normalized form (expected density)
+            # Paper: g_const(φ) = E_z|φ[||z||_0] / #(θ̃)
+            edge_mask = (adj_matrix > 0).float()
+            num_edges = edge_mask.sum()
+            expected_l0_density = l0_penalty / (num_edges + 1e-8)
+            
+            # Compute constraint violation: g_const(φ) - ε
+            # Constraint is: g_const(φ) ≤ ε
+            constraint_violation = expected_l0_density - self.constraint_target
+            
+            # Use current dual variable (will be updated after backward pass)
+            # Paper Eq. (4): L(θ̃, φ, λ_co) = f_obj(θ̃, φ) + λ_co * (g_const(φ) - ε)
+            lambda_eff = self.dual_lambda
+            
+            # Lagrangian term
+            reg_loss = lambda_eff * constraint_violation
+            
+            # No density loss in pure constrained mode
+            density_loss = torch.tensor(0.0, device=device)
+            
+            if return_stats:
+                stats = {
+                    'l0_loss': (lambda_eff * expected_l0_density).item() if isinstance(lambda_eff, float) else (lambda_eff * expected_l0_density).item(),
+                    'density_loss': 0.0,
+                    'reg_loss': reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss,
+                    'lambda_eff': lambda_eff,
+                    'dual_lambda': self.dual_lambda,
+                    'constraint_violation': constraint_violation.item() if isinstance(constraint_violation, torch.Tensor) else constraint_violation,
+                    'constraint_target': self.constraint_target,
+                    'expected_l0_density': expected_l0_density.item() if isinstance(expected_l0_density, torch.Tensor) else expected_l0_density,
+                    'current_density': current_density.item() if isinstance(current_density, torch.Tensor) else current_density,
+                    'constraint_satisfied': constraint_violation.item() <= 0 if isinstance(constraint_violation, torch.Tensor) else constraint_violation <= 0,
+                    'alpha': 1.0,  # Not used in constrained mode
+                    'mode': 'constrained',
+                }
+                return reg_loss, stats
+            
+            return reg_loss
+        
+        # ====================================================================
+        # PENALTY MODE
+        # ====================================================================
+        else:
+            # Compute effective lambda (with adaptive mechanism if enabled)
+            if self.enable_adaptive_lambda:
+                lambda_eff, alpha = self.compute_adaptive_lambda(current_density)
+            else:
+                lambda_eff = self.current_lambda
+                alpha = 1.0
+            
+            # L0 regularization loss
+            l0_loss = lambda_eff * l0_penalty
+            
+            # Density loss (if enabled)
+            if self.enable_density_loss and self.current_epoch >= self.warmup_epochs:
+                density_deviation = torch.abs(current_density - self.target_density)
+                density_loss = self.current_lambda_density * density_deviation
+            else:
+                density_loss = torch.tensor(0.0, device=device)
+            
+            # Total regularization
+            reg_loss = l0_loss + density_loss
+            
+            if return_stats:
+                stats = {
+                    'l0_loss': l0_loss.item() if isinstance(l0_loss, torch.Tensor) else l0_loss,
+                    'density_loss': density_loss.item() if isinstance(density_loss, torch.Tensor) else density_loss,
+                    'reg_loss': reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss,
+                    'lambda_eff': lambda_eff if isinstance(lambda_eff, float) else lambda_eff.item(),
+                    'alpha': alpha,
+                    'current_density': current_density.item() if isinstance(current_density, torch.Tensor) else current_density,
+                    'constraint_violation': 0.0,  # Not applicable in penalty mode
+                    'constraint_satisfied': True,  # Not applicable
+                    'dual_lambda': 0.0,  # Not used
+                    'mode': 'penalty',
+                }
+                return reg_loss, stats
+            
+            return reg_loss
+    
     def compute_regularization(self, edge_weights, adj_matrix, 
                                return_stats=True):
         """
         Compute complete regularization loss with density control
-        
-        Total loss:
-            L_total = λ_eff · L_L0 + L_density
-        
-        where:
-            - λ_eff = λ_base · α(ρ) (adaptive)
-            - L_L0 = Σ π_ij (expected number of edges)
-            - L_density = λ_ρ · (ρ - ρ_target)²
         
         Args:
             edge_weights: Edge gate values [batch_size, num_nodes, num_nodes]
@@ -523,7 +716,7 @@ class EGLassoRegularization:
                 (reg_loss, stats_dict): Loss and statistics dictionary
         """
         # Check if regularization is active
-        if self.current_lambda == 0.0 or not edge_weights.requires_grad:
+        if (not self.use_constrained and self.current_lambda == 0.0) or not edge_weights.requires_grad:
             if return_stats:
                 return torch.tensor(0.0, device=edge_weights.device), {
                     'total_reg_loss': 0.0,
@@ -532,27 +725,19 @@ class EGLassoRegularization:
                     'lambda_eff': 0.0,
                     'alpha': 1.0,
                     'current_density': 0.0,
-                    'target_density': self.target_density,
-                    'density_deviation': 0.0
+                    'target_density': self.target_density if not self.use_constrained else self.constraint_target,
+                    'density_deviation': 0.0,
+                    'mode': 'constrained' if self.use_constrained else 'penalty',
                 }
             else:
                 return torch.tensor(0.0, device=edge_weights.device)
         
         device = edge_weights.device
         
-        # ====================================================================
-        # 1. COMPUTE CURRENT DENSITY
-        # ====================================================================
+        # Compute current density
         current_density = compute_density(edge_weights, adj_matrix)
         
-        # ====================================================================
-        # 2. COMPUTE ADAPTIVE LAMBDA
-        # ====================================================================
-        lambda_eff, alpha = self.compute_adaptive_lambda(current_density)
-        
-        # ====================================================================
-        # 3. COMPUTE L0 LOSS
-        # ====================================================================
+        # Compute L0 loss
         if self.reg_mode == 'l0':
             l0_loss = self.compute_l0_loss()
         
@@ -575,41 +760,10 @@ class EGLassoRegularization:
         else:
             raise ValueError(f"Unsupported regularization mode: {self.reg_mode}")
         
-        # ====================================================================
-        # 4. COMPUTE DENSITY LOSS
-        # ====================================================================
-        density_loss = self.compute_density_loss(current_density)
-        
-        # ====================================================================
-        # 5. COMBINE LOSSES
-        # ====================================================================
-        # Apply adaptive lambda to L0 loss
-        weighted_l0_loss = lambda_eff * l0_loss
-        
-        # Total regularization
-        total_reg_loss = weighted_l0_loss + density_loss
-        
-        # ====================================================================
-        # 6. PREPARE STATISTICS
-        # ====================================================================
-        if return_stats:
-            stats = {
-                'total_reg_loss': total_reg_loss.item(),
-                'l0_loss': l0_loss.item(),
-                'weighted_l0_loss': weighted_l0_loss.item(),
-                'density_loss': density_loss.item(),
-                'lambda_base': self.current_lambda,
-                'lambda_eff': lambda_eff if isinstance(lambda_eff, float) else lambda_eff.item(),
-                'lambda_density': self.current_lambda_density,
-                'alpha': alpha,
-                'current_density': current_density.item(),
-                'target_density': self.target_density,
-                'density_deviation': abs(current_density.item() - self.target_density),
-                'density_error_pct': abs(current_density.item() - self.target_density) * 100,
-            }
-            return total_reg_loss, stats
-        else:
-            return total_reg_loss
+        # Use the unified method
+        return self.compute_regularization_with_l0(
+            l0_loss, edge_weights, adj_matrix, return_stats
+        )
     
     # ========================================================================
     # UTILITY FUNCTIONS
@@ -634,25 +788,40 @@ class EGLassoRegularization:
         Returns:
             stats: Dictionary of current state
         """
-        return {
+        base_stats = {
             'current_epoch': self.current_epoch,
             'reg_mode': self.reg_mode,
             'l0_method': self.l0_method,
-            # Lambda values
-            'base_lambda': self.base_lambda,
-            'current_lambda': self.current_lambda,
-            'base_lambda_density': self.base_lambda_density,
-            'current_lambda_density': self.current_lambda_density,
-            # Density control
-            'target_density': self.target_density,
-            'alpha_min': self.alpha_min,
-            'alpha_max': self.alpha_max,
-            'enable_adaptive_lambda': self.enable_adaptive_lambda,
-            'enable_density_loss': self.enable_density_loss,
-            # Schedule
+            'use_constrained': self.use_constrained,
             'warmup_epochs': self.warmup_epochs,
             'ramp_epochs': self.ramp_epochs,
         }
+        
+        if self.use_constrained:
+            base_stats.update({
+                'mode': 'constrained',
+                'dual_lambda': self.dual_lambda,
+                'dual_lr': self.dual_lr,
+                'constraint_target': self.constraint_target,
+                'enable_dual_restarts': self.enable_dual_restarts,
+                'num_violations': len(self.constraint_violation_history),
+                'num_satisfied': sum(self.constraint_satisfied_history) if self.constraint_satisfied_history else 0,
+            })
+        else:
+            base_stats.update({
+                'mode': 'penalty',
+                'base_lambda': self.base_lambda,
+                'current_lambda': self.current_lambda,
+                'base_lambda_density': self.base_lambda_density,
+                'current_lambda_density': self.current_lambda_density,
+                'target_density': self.target_density,
+                'alpha_min': self.alpha_min,
+                'alpha_max': self.alpha_max,
+                'enable_adaptive_lambda': self.enable_adaptive_lambda,
+                'enable_density_loss': self.enable_density_loss,
+            })
+        
+        return base_stats
     
     def print_configuration(self):
         """Print current configuration"""
@@ -668,18 +837,30 @@ class EGLassoRegularization:
         print(f"{'='*70}\n")
     
     def __repr__(self):
-        return (f"EGLassoRegularization(\n"
-                f"  mode={self.reg_mode},\n"
-                f"  l0_method={self.l0_method},\n"
-                f"  base_lambda={self.base_lambda:.6f},\n"
-                f"  current_lambda={self.current_lambda:.6f},\n"
-                f"  target_density={self.target_density:.2f},\n"
-                f"  current_lambda_density={self.current_lambda_density:.6f},\n"
-                f"  adaptive_lambda={'enabled' if self.enable_adaptive_lambda else 'disabled'},\n"
-                f"  density_loss={'enabled' if self.enable_density_loss else 'disabled'},\n"
-                f"  current_epoch={self.current_epoch},\n"
-                f"  warmup_epochs={self.warmup_epochs}\n"
-                f")")
+        if self.use_constrained:
+            return (f"EGLassoRegularization(CONSTRAINED):\n"
+                    f"  mode={self.reg_mode},\n"
+                    f"  l0_method={self.l0_method},\n"
+                    f"  dual_lambda={self.dual_lambda:.6f},\n"
+                    f"  dual_lr={self.dual_lr:.6f},\n"
+                    f"  constraint_target={self.constraint_target:.2f},\n"
+                    f"  dual_restarts={'enabled' if self.enable_dual_restarts else 'disabled'},\n"
+                    f"  current_epoch={self.current_epoch},\n"
+                    f"  warmup_epochs={self.warmup_epochs}\n"
+                    f")")
+        else:
+            return (f"EGLassoRegularization(PENALTY):\n"
+                    f"  mode={self.reg_mode},\n"
+                    f"  l0_method={self.l0_method},\n"
+                    f"  base_lambda={self.base_lambda:.6f},\n"
+                    f"  current_lambda={self.current_lambda:.6f},\n"
+                    f"  target_density={self.target_density:.2f},\n"
+                    f"  current_lambda_density={self.current_lambda_density:.6f},\n"
+                    f"  adaptive_lambda={'enabled' if self.enable_adaptive_lambda else 'disabled'},\n"
+                    f"  density_loss={'enabled' if self.enable_density_loss else 'disabled'},\n"
+                    f"  current_epoch={self.current_epoch},\n"
+                    f"  warmup_epochs={self.warmup_epochs}\n"
+                    f")")
 
 
 # ============================================================================
@@ -687,22 +868,9 @@ class EGLassoRegularization:
 # ============================================================================
 
 class LambdaSchedule:
-    """
-    Standalone lambda schedule for use in training scripts
-    
-    Three-phase schedule:
-    - Phase 1: Linear warmup to 10% of base
-    - Phase 2: Linear ramp to 100% of base
-    - Phase 3: Plateau at base value
-    """
+    """Standalone lambda schedule for use in training scripts"""
     
     def __init__(self, base_lambda=0.0001, warmup_epochs=15, ramp_epochs=20):
-        """
-        Args:
-            base_lambda: Target lambda value (λ_base)
-            warmup_epochs: Warmup duration (E_warmup)
-            ramp_epochs: Ramp duration after warmup (E_ramp)
-        """
         self.base_lambda = base_lambda
         self.warmup_epochs = warmup_epochs
         self.ramp_epochs = ramp_epochs
@@ -710,37 +878,20 @@ class LambdaSchedule:
     def get_lambda(self, epoch):
         """Get lambda for given epoch"""
         if epoch < self.warmup_epochs:
-            # Phase 1: Warmup to 10%
             progress = epoch / self.warmup_epochs
             return progress * 0.1 * self.base_lambda
-        
         elif epoch < self.warmup_epochs + self.ramp_epochs:
-            # Phase 2: Ramp from 10% to 100%
             post_warmup = epoch - self.warmup_epochs
             progress = post_warmup / self.ramp_epochs
             return self.base_lambda * (0.1 + 0.9 * progress)
-        
         else:
-            # Phase 3: Plateau at 100%
             return self.base_lambda
 
 
 class DensityLambdaSchedule:
-    """
-    Standalone density lambda schedule
-    
-    Two-phase schedule:
-    - Phase 1: Linear warmup to 50% of base
-    - Phase 2: Linear ramp to 100% of base
-    """
+    """Standalone density lambda schedule"""
     
     def __init__(self, base_lambda_density=0.03, warmup_epochs=15, ramp_epochs=10):
-        """
-        Args:
-            base_lambda_density: Target density lambda (λ_ρ^base)
-            warmup_epochs: Warmup duration (E_warmup)
-            ramp_epochs: Ramp duration after warmup
-        """
         self.base_lambda_density = base_lambda_density
         self.warmup_epochs = warmup_epochs
         self.ramp_epochs = ramp_epochs
@@ -748,40 +899,21 @@ class DensityLambdaSchedule:
     def get_lambda_density(self, epoch):
         """Get density lambda for given epoch"""
         if epoch < self.warmup_epochs:
-            # Phase 1: Warmup to 50%
             progress = epoch / self.warmup_epochs
             return progress * 0.5 * self.base_lambda_density
-        
         elif epoch < self.warmup_epochs + self.ramp_epochs:
-            # Phase 2: Ramp from 50% to 100%
             post_warmup = epoch - self.warmup_epochs
             progress = post_warmup / self.ramp_epochs
             scale = 0.5 + 0.5 * progress
             return scale * self.base_lambda_density
-        
         else:
-            # Plateau at 100%
             return self.base_lambda_density
 
 
 class TemperatureSchedule:
-    """
-    Standalone temperature schedule with cosine annealing
-    
-    Three-phase schedule:
-    - Phase 1: Constant at initial temperature
-    - Phase 2: Cosine annealing to minimum
-    - Phase 3: Plateau at minimum
-    """
+    """Standalone temperature schedule with cosine annealing"""
     
     def __init__(self, tau_init=5.0, tau_min=1.0, t_warmup=15, t_anneal=35):
-        """
-        Args:
-            tau_init: Initial temperature (τ_init)
-            tau_min: Minimum temperature (τ_min)
-            t_warmup: Warmup end epoch
-            t_anneal: Annealing end epoch
-        """
         self.tau_init = tau_init
         self.tau_min = tau_min
         self.t_warmup = t_warmup
@@ -791,18 +923,11 @@ class TemperatureSchedule:
     def get_temperature(self, epoch):
         """Get temperature for given epoch"""
         if epoch < self.t_warmup:
-            # Phase 1: Constant
             return self.tau_init
-        
         elif epoch <= self.t_anneal:
-            # Phase 2: Cosine annealing
             progress = (epoch - self.t_warmup) / (self.t_anneal - self.t_warmup)
             progress = min(1.0, max(0.0, progress))
             mu = self.mu_min + (1 - self.mu_min) * (np.cos(progress * np.pi) + 1) / 2
             return max(self.tau_min, self.tau_init * mu)
-        
         else:
-            # Phase 3: Plateau
             return self.tau_min
-
-

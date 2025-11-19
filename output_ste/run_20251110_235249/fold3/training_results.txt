@@ -1,0 +1,64 @@
+LENS MODEL TRAINING RESULTS
+============================================================
+
+MODEL CONFIGURATION
+----------------------------------------
+L0 Method: ste
+Lambda (λ): 1.5e-05
+Regularization Mode: l0
+L0 Parameters:
+  - gamma (γ): -0.1
+  - zeta (ζ): 1.1
+  - beta (β): 0.66
+
+Architecture:
+  - Edge Dimension: 32
+  - Hidden Dimensions: 128
+  - Dropout: 0.2
+
+Training:
+  - Epochs: 50
+  - Warmup Epochs: 25
+  - Learning Rate: 0.001
+  - Weight Decay: 0.0005
+  - Batch Size: 1
+
+Graph Processing:
+  - Graph Size Adaptation: False
+  - Min Edges Per Node: 2.0
+
+============================================================
+PERFORMANCE RESULTS
+----------------------------------------
+Best Validation Accuracy: 0.8146
+Best Epoch: 25
+Edge Sparsity at Best: 100.0% (edges > 0.1)
+
+Final Epoch:
+  - Train Accuracy: 0.7062
+  - Val Accuracy: 0.6325
+  - Train Loss: 0.9251
+  - Val Loss: 3.4006
+
+============================================================
+OVERFITTING ANALYSIS
+----------------------------------------
+Severity: Severe
+Average Train-Val Gap (post-warmup): 0.1405
+Maximum Train-Val Gap: 0.3464
+Max Gap Epoch: 27
+
+============================================================
+RECOMMENDATIONS
+----------------------------------------
+Model shows severe overfitting.
+
+Suggestions:
+  1. Increase lambda (try 2-3x current value)
+  2. Increase dropout (try 0.3-0.4)
+  3. Increase weight decay
+  4. Reduce model capacity
+
+============================================================
+METHOD-SPECIFIC NOTES (STE)
+----------------------------------------

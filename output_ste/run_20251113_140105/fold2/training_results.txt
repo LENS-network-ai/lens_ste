@@ -1,0 +1,70 @@
+LENS MODEL TRAINING RESULTS
+============================================================
+
+MODEL CONFIGURATION
+----------------------------------------
+L0 Method: arm
+Lambda (λ): 1.5e-05
+Regularization Mode: l0
+L0 Parameters:
+  - gamma (γ): -0.1
+  - zeta (ζ): 1.1
+  - beta (β): 0.66
+  - baseline_ema: 0.9
+
+Architecture:
+  - Edge Dimension: 32
+  - Hidden Dimensions: 128
+  - Dropout: 0.2
+
+Training:
+  - Epochs: 100
+  - Warmup Epochs: 60
+  - Learning Rate: 0.001
+  - Weight Decay: 0.0005
+  - Batch Size: 1
+
+Graph Processing:
+  - Graph Size Adaptation: False
+  - Min Edges Per Node: 2.0
+
+============================================================
+PERFORMANCE RESULTS
+----------------------------------------
+Best Validation Accuracy: 0.8526
+Best Epoch: 58
+Edge Sparsity at Best: 100.0% (edges > 0.1)
+
+Final Epoch:
+  - Train Accuracy: 0.8469
+  - Val Accuracy: 0.7987
+  - Train Loss: -1.9671
+  - Val Loss: 0.7076
+
+============================================================
+OVERFITTING ANALYSIS
+----------------------------------------
+Severity: Severe
+Average Train-Val Gap (post-warmup): 0.0404
+Maximum Train-Val Gap: 0.3086
+Max Gap Epoch: 36
+
+============================================================
+RECOMMENDATIONS
+----------------------------------------
+Model shows severe overfitting.
+
+Suggestions:
+  1. Increase lambda (try 2-3x current value)
+  2. Increase dropout (try 0.3-0.4)
+  3. Increase weight decay
+  4. Reduce model capacity
+
+============================================================
+METHOD-SPECIFIC NOTES (ARM)
+----------------------------------------
+ARM (Augment-REINFORCE-Merge):
+  ✓ Direct binary sampling during training
+  ✓ Control variates reduce gradient variance
+  → Check gradient variance in WandB logs
+  → If unstable, try increasing baseline_ema
