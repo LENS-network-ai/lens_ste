@@ -276,7 +276,7 @@ class EGLassoRegularization:
         Returns:
             updated_lambda: New dual variable value
         """
-        if self.current_epoch < self.warmup_epochs + self.ramp_epochs:
+        if self.current_epoch < self.warmup_epochs:
             self.dual_lambda = 0.0
             return 0.0
         if not self.use_constrained:
@@ -634,7 +634,7 @@ class EGLassoRegularization:
             
             # Use current dual variable (will be updated after backward pass)
             # Paper Eq. (4): L(θ̃, φ, λ_co) = f_obj(θ̃, φ) + λ_co * (g_const(φ) - ε)
-            if self.current_epoch < self.warmup_epochs + self.ramp_epochs:
+            if self.current_epoch < self.warmup_epochs:
                     lambda_eff = 0.0
                     constraint_violation = torch.tensor(0.0, device=device)
             else:
